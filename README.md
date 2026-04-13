@@ -1,146 +1,113 @@
-# LZ-ADaudit
+```
+  ██╗     ███████╗      █████╗ ██████╗  █████╗ ██╗   ██╗██████╗ ██╗████████╗
+  ██║     ╚══███╔╝     ██╔══██╗██╔══██╗██╔══██╗██║   ██║██╔══██╗██║╚══██╔══╝
+  ██║       ███╔╝      ███████║██║  ██║███████║██║   ██║██║  ██║██║   ██║
+  ██║      ███╔╝       ██╔══██║██║  ██║██╔══██║██║   ██║██║  ██║██║   ██║
+  ███████╗███████╗     ██║  ██║██████╔╝██║  ██║╚██████╔╝██████╔╝██║   ██║
+  ╚══════╝╚══════╝     ╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝   ╚═╝
+```
 
-LZ-ADaudit es un script PowerShell para auditoria de Active Directory orientado a ejecucion en Domain Controller (DC) o desde remote shell no interactiva (por ejemplo, EDR).
+**Active Directory Security Assessment** | Lazarus Security Framework | `v1.3.0`
 
-Diseno operativo:
-- Script unico (`AdAudit.ps1`), sin base de datos y sin UI local.
-- Salida estructurada priorizada para pipelines (`JSON`, `NDJSON`, `CSV`).
-- Compatible con ejecucion silenciosa (`-quiet`) y logs en archivo.
+---
 
-Release actual:
-- `tool_name`: `LZ-ADaudit`
-- `tool_version`: `v1.0.0`
-- `schema_version`: `1.0`
-- `release_date`: `2026-04-12`
+Herramienta de auditoría de Active Directory diseñada para ejecución en Domain Controller o desde shell remota no interactiva (EDR, RDP, WinRM). Script único, sin dependencias externas obligatorias, salida estructurada lista para pipelines y generación automática de informes HTML + XLSX.
 
-Nota de versionado:
-- Este repositorio se publica como herramienta nueva desde `v1.0.0`.
-- No requiere heredar numeracion historica `5.x/6.x`.
+## Componentes
 
-## Que incluye v1.0.0
-
-- Contrato de salida estable para pipelines (`execution.json`, `summary.json`, `findings.ndjson`, `findings.csv`).
-- Modo `incident-response` para entornos post-compromiso.
-- Correlacion de eventos de seguridad para trazabilidad (`4720`, `4728`, `4732`, `4756`).
-- Soporte de baseline diff entre ejecuciones para comparar evolucion de riesgo.
-
-## Respuesta rapida: trazabilidad de creacion de cuentas
-
-Pregunta frecuente: "Esto ya incluye quien creo un usuario/grupo?"
-
-Respuesta corta:
-- Si, en modo incident response ahora hay correlacion nativa de Security Event Log para IDs `4720`, `4728`, `4732` y `4756`.
-- Si detecta objetos nuevos por fecha (`whenCreated`) con `-recentchanges`.
-- Tambien exporta inventarios con columna `WhenCreated` (`inventory/users.csv`, `inventory/groups.csv`).
-
-Salida IR relacionada:
-- `evidence/security_events.json`
-- `evidence/security_events.csv`
-
-Nota:
-- La trazabilidad depende de retencion del log `Security` y de permisos de lectura sobre ese log.
+| Archivo | Descripción |
+|---|---|
+| `AdAudit.ps1` | Motor de auditoría PowerShell — recopila evidencia, genera findings |
+| `report_generator.py` | Generador de informes — consume salida de AdAudit, produce HTML + XLSX |
 
 ## Requisitos
 
-Minimos:
-- Windows PowerShell `5+`
-- Modulo `ActiveDirectory` (RSAT)
+**Mínimos:**
+- PowerShell 5.0+
+- Módulo `ActiveDirectory` (RSAT)
+- Ejecutar como Administrador en un DC (o cuenta con derechos de lectura AD)
 
-Opcionales:
-- Modulo `GroupPolicy` (mejora checks y evidencia GPO)
-- Modulo `DSInternals` (password quality, capacidades opcionales)
+**Opcionales:**
+- Módulo `GroupPolicy` — mejora checks GPO y exportación
+- Módulo `DSInternals` — análisis de calidad de contraseñas (`-ntds`)
+- Python 3.8+ con `openpyxl` — para `report_generator.py`
 
-Recomendado:
-- Ejecutar como administrador local en DC.
-
-## Ejecucion rapida
-
-Ejemplo baseline de auditoria:
+## Ejecución rápida
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\AdAudit.ps1 -profile standard -quiet -outputPath C:\AuditOut
+# Auditoría estándar
+powershell -ExecutionPolicy Bypass -File .\AdAudit.ps1 -profile standard -outputPath C:\AuditOut
+
+# Deep con todos los módulos
+powershell -ExecutionPolicy Bypass -File .\AdAudit.ps1 -profile deep -inventory -evidence -outputPath C:\AuditOut
+
+# Incident Response (post-compromiso)
+powershell -ExecutionPolicy Bypass -File .\AdAudit.ps1 -incidentresponse -outputPath C:\AuditOut
+
+# Módulos individuales
+powershell -ExecutionPolicy Bypass -File .\AdAudit.ps1 -kerbdelegation -dcsync -hosthardening -outputPath C:\AuditOut
 ```
 
-Preflight solamente:
+```bash
+# Generar informe HTML + XLSX (detecta carpeta automáticamente)
+python report_generator.py
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\AdAudit.ps1 -preflight -outputPath C:\AuditOut
+# Especificar carpeta
+python report_generator.py -f C:\AuditOut\20260413_120000
 ```
-
-Auditoria con inventario y evidencia:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\AdAudit.ps1 -profile evidence -inventory -evidence -quiet -outputPath C:\AuditOut
-```
-
-Modo incident response (alias rapido):
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\AdAudit.ps1 -incidentresponse -quiet -outputPath C:\AuditOut
-```
-
-Tambien puedes usar:
-- `-incident-response`
-- `-incident-respones` (alias tolerante para typo operativo)
-
-Comparacion contra ejecucion previa:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\AdAudit.ps1 -profile standard -baseline C:\AuditOut-Previo -outputPath C:\AuditOut-Nuevo
-```
-
-`-baseline` acepta:
-- Ruta de carpeta de salida previa (busca `findings.csv` o `findings.ndjson`).
-- Ruta directa a `findings.csv`.
-- Ruta directa a `findings.ndjson`.
 
 ## Perfiles
 
-Perfiles actuales:
-- `light`: rapido y bajo impacto.
-- `standard`: cobertura equilibrada por defecto.
-- `deep`: incluye mas modulos y tambien `-ntds`.
-- `evidence`: cobertura amplia con orientacion a evidencia, sin `-ntds` por defecto.
-- `incident-response`: perfil enfocado a post-incidente, incluye correlacion de eventos de seguridad y activa modo de evidencia/inventario.
-- `inventory-only`: inventario base, menor carga.
+| Perfil | Módulos incluidos |
+|---|---|
+| `light` | hostdetails, accounts, passwordpolicy, ldapsecurity |
+| `standard` | + domainaudit, trusts, oldboxes, gpo, laps, dns, recentchanges, spn, asrep, **kerbdelegation**, **hosthardening** |
+| `deep` | + ouperms, authpolsilos, **dcsync**, acl, adcs, ntds |
+| `evidence` | deep sin ntds |
+| `incident-response` | evidence + securityevents |
+| `inventory-only` | hostdetails, domainaudit, accounts, oldboxes |
 
-Regla importante:
-- `deep` ya incluye `ntds`.
-- Si usas `evidence` y quieres dump de NTDS, agrega `-ntds` manualmente.
+## Módulos disponibles
 
-## Diferencia entre ejecutar con `-ntds` y sin `-ntds`
-
-Sin `-ntds`:
-- Evalua postura de seguridad AD (ACL, GPO, LDAP, cuentas, trusts, LAPS, ADCS, etc).
-- Permite detectar usuarios/grupos recientes (`-recentchanges`) y cambios de inventario.
-- Menor riesgo operativo y menor sensibilidad de datos.
-
-Con `-ntds`:
-- Ejecuta `ntdsutil` para generar copia de `ntds.dit` y artefactos asociados en salida.
-- Aporta valor forense alto para analisis de credenciales post-compromiso.
-- Incrementa sensibilidad, riesgo y requisitos de manejo seguro de evidencia.
-
-Recomendacion IR:
-- Primera corrida: sin `-ntds` (triage rapido).
-- Segunda corrida: con `-ntds` solo si hay aprobacion y cadena de custodia clara.
-- Si usas `-incidentresponse`, ya incluye `securityevents` para mapear actor/miembro/grupo en cambios recientes.
+| Switch | Descripción | Severidad máx. |
+|---|---|---|
+| `-hostdetails` | Info del host, OS, dominio | INFO |
+| `-domainaudit` | Nivel funcional, SMB, Kerberos, FSMO, DCs | HIGH |
+| `-trusts` | Trusts de dominio/forest | MEDIUM |
+| `-accounts` | Inactivos, bloqueados, privilegiados, protectedusers | HIGH |
+| `-passwordpolicy` | Política de contraseñas (default + FGPP) | MEDIUM |
+| `-ntds` | Dump de NTDS.dit via ntdsutil | CRITICAL |
+| `-oldboxes` | Sistemas operativos EOL en el dominio | HIGH |
+| `-gpo` | Exportación GPO, scan SYSVOL por credenciales | CRITICAL |
+| `-ouperms` | Permisos no estándar en OUs | HIGH |
+| `-laps` | Estado LAPS (legacy + Windows LAPS) | HIGH |
+| `-authpolsilos` | Políticas de autenticación y silos | MEDIUM |
+| `-insecurednszone` | Zonas DNS con actualizaciones inseguras | MEDIUM |
+| `-recentchanges` | Usuarios y grupos creados en los últimos 30 días | MEDIUM |
+| `-spn` | Cuentas Kerberoasteables de alto valor | HIGH |
+| `-asrep` | Cuentas sin pre-autenticación Kerberos (AS-REP) | HIGH |
+| `-kerbdelegation` | **[NUEVO]** Delegación Kerberos sin restricción (excl. DCs) | CRITICAL |
+| `-dcsync` | **[NUEVO]** Cuentas con derechos DCSync (DS-Replication-Get-Changes-All) | CRITICAL |
+| `-hosthardening` | **[NUEVO]** WDigest, LSA Protection (RunAsPPL), Credential Guard | HIGH |
+| `-acl` | Permisos ACL peligrosos en objetos AD | HIGH |
+| `-adcs` | Vulnerabilidades ADCS (ESC1-4, ESC8) | CRITICAL |
+| `-ldapsecurity` | Firma LDAP, LDAPS, channel binding, null sessions | HIGH |
+| `-securityevents` | Correlación de eventos de seguridad (4720/4728/4732/4756) | HIGH |
 
 ## Estructura de salida
 
-Salida estructurada principal (segun modo):
-
-```text
+```
 <outputPath>\
-  execution.json
-  preflight.json
-  summary.json
-  findings.ndjson
-  findings.csv
-  adaudit.nessus                 (si no usas -noNessus)
+  execution.json          metadata de ejecución, módulos, tiempos
+  preflight.json          resultado de checks de prerequisitos
+  summary.json            resumen de findings por severidad/categoría
+  findings.ndjson         findings en formato NDJSON (un objeto por línea)
+  findings.csv            mismo contenido en CSV para Excel/SIEM
+  adaudit.nessus          XML Nessus (omitir con -noNessus)
   logs\
     console.log
     debug.log
-  inventory\                     (si inventory mode activo)
+  inventory\              (activado con -inventory)
     users.csv
     groups.csv
     computers.csv
@@ -150,108 +117,89 @@ Salida estructurada principal (segun modo):
     privileged_accounts.csv
     service_accounts.csv
     adcs_templates.csv
-  evidence\                      (si inventory mode activo)
-    password_policy.json
-    trusts.json
-    gpo.json
-    laps.json
+  evidence\               (activado con -evidence)
     domain.json
+    password_policy.json
     ldap.json
+    laps.json
+    gpo.json
     acl.json
     adcs.json
+    trusts.json
     security_events.json
     security_events.csv
-  diff\                          (si usas -baseline)
-    diff-summary.json
-    findings-added.csv
-    findings-removed.csv
-    findings-changed.csv
-    inventory-*-added.csv
-    inventory-*-removed.csv
 ```
 
-Nota:
-- Ademas de estos archivos estructurados, algunos modulos legacy siguen dejando artefactos `.txt/.html` para compatibilidad.
+Los módulos también generan archivos `.txt` de evidencia bruta en la raíz de salida (`ASREP.txt`, `UnconstrainedDelegation.txt`, `DCSyncRights.txt`, `HostHardening.txt`, etc.) que `report_generator.py` consume automáticamente.
 
-## Modos de consola y logging
+## Informe generado (`report_generator.py`)
 
-Control de salida:
-- `-quiet`: silencia consola (se mantienen logs en archivo).
-- `-logLevel normal|verbose|debug`: controla verbosidad de consola.
+El generador produce dos archivos en la carpeta de auditoría:
 
-Logs:
-- `logs/console.log`: salida operativa.
-- `logs/debug.log`: salida detallada con timestamp.
+- `report.html` — informe interactivo con gráficos, plan de remediación priorizado, tabla de findings sortable, controles positivos detectados
+- `report.xlsx` — workbook Excel con 21 hojas: Summary, Findings, inventarios, políticas, evidencia LDAP/LAPS/GPO/ADCS, plan de remediación
 
-## Estados de finding
-
-Estados normalizados soportados:
-- `passed`
-- `failed`
-- `warning`
-- `not_applicable`
-- `not_evaluated`
-- `partial`
-- `error`
-
-Severidad soportada:
-- `informational`, `low`, `medium`, `high`, `critical`
+Características del informe:
+- Auto-detección de la carpeta de auditoría más reciente
+- Gráficos SVG inline con botón "Copy as PNG" para reportes
+- Pasos de remediación detallados por check_id con comandos PowerShell
+- Referencias MITRE ATT&CK y CIS Benchmark por hallazgo
+- CSS de impresión incluido (`Ctrl+P`)
 
 ## Codigos de salida
 
-Comportamiento actual:
-- `0`: ejecucion completa sin findings accionables.
-- `1`: ejecucion completa con findings.
-- `2`: ejecucion parcial (modulos fallidos o timeout/partial).
-- `3`: fallo de preflight en modo `-preflight` o error de prerequisito critico (ej. modulo AD faltante al arrancar).
-- `4`: error fatal al preparar salida (ej. no se puede crear directorio de output).
-- `5`: parametros/seleccion invalida (ej. ejecutar sin checks/modos).
+| Código | Significado |
+|---|---|
+| `0` | Ejecución completa sin findings accionables |
+| `1` | Ejecución completa con findings |
+| `2` | Ejecución parcial (módulos fallidos o timeout) |
+| `3` | Fallo de preflight o prerequisito crítico ausente |
+| `4` | Error fatal preparando directorio de salida |
+| `5` | Parámetros inválidos o ningún módulo seleccionado |
 
-## Modulos principales disponibles
+## Opciones de control
 
-Por switch:
-- `-hostdetails`
-- `-domainaudit`
-- `-trusts`
-- `-accounts`
-- `-passwordpolicy`
-- `-ntds`
-- `-oldboxes`
-- `-gpo`
-- `-ouperms`
-- `-laps`
-- `-authpolsilos`
-- `-insecurednszone`
-- `-recentchanges`
-- `-spn`
-- `-asrep`
-- `-acl`
-- `-adcs`
-- `-ldapsecurity`
-- `-securityevents`
-- `-all`
+```powershell
+-profile <light|standard|deep|evidence|incident-response|inventory-only>
+-select <lista>          # ej: -select "spn,asrep,kerbdelegation"
+-exclude <lista>         # ej: -exclude "ntds,securityevents"
+-outputPath <ruta>
+-quiet                   # silencia consola, mantiene logs
+-logLevel <normal|verbose|debug>
+-noNessus                # omite adaudit.nessus
+-inventory               # exporta CSVs de inventario
+-evidence                # exporta JSONs de evidencia estructurada
+-preflight               # solo checks de prerequisitos, sin auditoría
+-moduleTimeoutSeconds <n>
+-installdeps             # instala DSInternals si no está presente
+```
 
-Control adicional:
-- `-select <lista>`
-- `-exclude <lista>`
-- `-moduleTimeoutSeconds <n>`
-- `-outputPath <ruta>`
-- `-baseline <ruta>`
-- `-inventory`
-- `-evidence`
-- `-preflight`
-- `-noNessus`
-- `-incidentresponse` (alias: `-incident-response`, `-incident-respones`)
+## Nuevos checks v1.3.0
 
-## Roadmap sugerido (alineado a IR)
+### Unconstrained Kerberos Delegation (`-kerbdelegation`)
+Detecta usuarios y equipos con `TrustedForDelegation = True`, excluyendo automáticamente los Domain Controllers legítimos. Un atacante que compromete un host con delegación sin restricción puede capturar TGTs de cualquier usuario que se autentique — incluyendo Domain Admins.
 
-Siguiente mejora recomendada para IR:
-- Ampliar correlacion a mas IDs (`4726`, `4738`, `4740`, `4767`) y agrupar por cadena de ataque.
-- Marcar explicitamente grupos de alta sensibilidad (Domain Admins, Enterprise Admins, Administrators, etc.) con prioridad extra.
+### DCSync Rights (`-dcsync`)
+Audita la ACL del objeto raíz del dominio buscando el ACE `DS-Replication-Get-Changes-All` (GUID `1131f6ad-...`) en cuentas no pertenecientes a los grupos legítimos (DCs, Domain Admins, Enterprise Admins, SYSTEM). Una cuenta con este derecho puede volcar todos los hashes del dominio sin tocar el DC físicamente.
+
+### Host Hardening (`-hosthardening`)
+Verifica en el DC local:
+- **WDigest** `UseLogonCredential` — si está en `1`, las credenciales en texto plano se cachean en LSASS (Mimikatz las extrae directamente)
+- **LSA Protection** `RunAsPPL` — si está ausente o en `0`, LSASS no está protegido como proceso PPL
+- **Credential Guard / VBS** — informacional
 
 ## Uso responsable
 
-Esta herramienta maneja datos sensibles de AD. Si habilitas `-ntds`:
-- Define cadena de custodia.
-- Restringe acceso a carpeta de salida.
-- Protege y elimina evidencia segun politica de IR/forense.
+Esta herramienta genera evidencia sensible de Active Directory. Aplica las siguientes medidas:
+
+- Restringe el acceso a la carpeta de salida (`icacls` o ACL NTFS)
+- Si usas `-ntds`, define cadena de custodia antes de ejecutar
+- Elimina la evidencia según la política de retención de tu organización
+- No ejecutes en producción sin autorización explícita
+
+## Changelog
+
+| Versión | Fecha | Cambios principales |
+|---|---|---|
+| v1.0.0 | 12/04/2026 | Release inicial — contrato de salida estable, perfiles, incident-response |
+| v1.3.0 | 13/04/2026 | kerbdelegation, dcsync, hosthardening — nuevos módulos y DB de remediación |

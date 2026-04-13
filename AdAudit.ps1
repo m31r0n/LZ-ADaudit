@@ -16,6 +16,13 @@
                 * Structured output contract (execution/summary/findings + CSV/NDJSON)
                 * Baseline diff support and inventory/evidence exports
                 * Incident-response profile with Security event correlation
+            [x] Version 1.3.0 - 13/04/2026
+                * New module: kerbdelegation — Unconstrained Kerberos Delegation detection
+                * New module: dcsync — DCSync rights (DS-Replication-Get-Changes-All) audit
+                * New module: hosthardening — WDigest, LSA Protection (RunAsPPL), Credential Guard
+                * kerbdelegation + hosthardening added to standard profile
+                * dcsync added to deep / evidence / incident-response profiles
+                * report_generator.py: new _REMEDIATION_DB entries for all 3 new check_ids
     .EXAMPLE
         PS> AdAudit.ps1 -all
     .EXAMPLE
@@ -84,7 +91,7 @@ $script:switchesUsed    = @($MyInvocation.BoundParameters.Keys)
 $script:resolvedProfile = $profile
 $script:modulesRequested = @()
 
-$versionnum = "v1.0.0"
+$versionnum = "v1.3.0"
 $AdministratorTranslation = @("Administrator", "Administrateur", "Administrador")#If missing put the default Administrator name for your own language here
 
 Function Get-Variables() {
@@ -2344,6 +2351,165 @@ function Get-ADUsersWithoutPreAuth {
     }
 }
 
+function Get-UnconstrainedDelegation {
+    Write-Both "    [+] Checking for accounts with unconstrained Kerberos delegation..."
+    # Domain Controllers legitimately hold unconstrained delegation — exclude them
+    $DCs = (Get-ADDomainController -Filter *).Name
+    $findings = @()
+
+    # User accounts with unconstrained delegation (TrustedForDelegation)
+    $users = Get-ADUser -Filter { TrustedForDelegation -eq $true -and Enabled -eq $true } `
+                        -Properties TrustedForDelegation, ServicePrincipalName, LastLogonDate, DistinguishedName
+    foreach ($u in $users) {
+        $line = "USER  | $($u.SamAccountName) | LastLogon: $($u.LastLogonDate) | DN: $($u.DistinguishedName)"
+        Write-Both "    [!] Unconstrained delegation (user): $($u.SamAccountName)"
+        $findings += $line
+    }
+
+    # Computer accounts with unconstrained delegation, excluding DCs
+    $computers = Get-ADComputer -Filter { TrustedForDelegation -eq $true } `
+                                -Properties TrustedForDelegation, OperatingSystem, LastLogonDate, DistinguishedName |
+                 Where-Object { $DCs -notcontains $_.Name }
+    foreach ($c in $computers) {
+        $line = "COMPUTER | $($c.Name) | OS: $($c.OperatingSystem) | LastLogon: $($c.LastLogonDate) | DN: $($c.DistinguishedName)"
+        Write-Both "    [!] Unconstrained delegation (computer): $($c.Name)"
+        $findings += $line
+    }
+
+    if ($findings.Count -gt 0) {
+        $evidencePath = "$outputdir\UnconstrainedDelegation.txt"
+        $findings | Set-Content -Path $evidencePath
+        Write-Nessus-Finding "Unconstrained Kerberos Delegation" "KB730" ([System.IO.File]::ReadAllText($evidencePath))
+    } else {
+        Write-Both "    [+] No accounts with unconstrained delegation found (excluding DCs)"
+    }
+    Write-Both "    [-] Finished checking unconstrained Kerberos delegation"
+}
+
+function Get-DCSyncRights {
+    Write-Both "    [+] Checking for accounts with DCSync rights (DS-Replication-Get-Changes-All)..."
+    # GUID for DS-Replication-Get-Changes-All extended right
+    $replicationGuid = '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2'
+    $domainDN = (Get-ADDomain).DistinguishedName
+    $domainSID = (Get-ADDomain).DomainSID
+
+    # Built-in accounts that legitimately hold this right
+    $builtinSIDs = @(
+        "$domainSID-516",   # Domain Controllers
+        "$domainSID-521",   # Read-Only Domain Controllers
+        'S-1-5-18',         # SYSTEM
+        'S-1-5-32-544',     # BUILTIN\Administrators
+        "$domainSID-512",   # Domain Admins
+        "$domainSID-519",   # Enterprise Admins
+        'S-1-5-9'           # Enterprise Domain Controllers
+    )
+
+    $findings = @()
+    try {
+        $acl = (Get-Acl "AD:\$domainDN").Access | Where-Object {
+            $_.ObjectType -eq $replicationGuid -and
+            $_.ActiveDirectoryRights -match 'ExtendedRight' -and
+            $_.AccessControlType -eq 'Allow'
+        }
+        foreach ($ace in $acl) {
+            $identity = $ace.IdentityReference.Value
+            # Resolve SID if needed
+            $resolvedSID = $null
+            try {
+                $resolvedSID = (New-Object System.Security.Principal.NTAccount($identity)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+            } catch { $resolvedSID = $identity }
+
+            if ($builtinSIDs -notcontains $resolvedSID) {
+                $line = "IDENTITY: $identity | SID: $resolvedSID | Right: DS-Replication-Get-Changes-All"
+                Write-Both "    [!] Non-standard DCSync right: $identity"
+                $findings += $line
+            }
+        }
+    } catch {
+        Write-Both "    [!] Error querying domain object ACL: $_"
+    }
+
+    if ($findings.Count -gt 0) {
+        $evidencePath = "$outputdir\DCSyncRights.txt"
+        $findings | Set-Content -Path $evidencePath
+        Write-Nessus-Finding "DCSync Rights Detected" "KB731" ([System.IO.File]::ReadAllText($evidencePath))
+    } else {
+        Write-Both "    [+] No non-standard accounts with DCSync rights found"
+    }
+    Write-Both "    [-] Finished checking DCSync rights"
+}
+
+function Get-HostHardeningChecks {
+    Write-Both "    [+] Checking host hardening settings (WDigest, LSA Protection)..."
+    $findings = @()
+
+    # --- WDigest credential caching ---
+    $wdigestPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest'
+    try {
+        $useLogonCredential = (Get-ItemProperty -Path $wdigestPath -Name 'UseLogonCredential' -ErrorAction Stop).UseLogonCredential
+        if ($useLogonCredential -eq 1) {
+            $msg = "WDigest UseLogonCredential = 1 on $env:COMPUTERNAME — plaintext credentials cached in LSASS memory"
+            Write-Both "    [!] $msg"
+            $findings += $msg
+        } else {
+            Write-Both "    [+] WDigest UseLogonCredential is disabled ($useLogonCredential)"
+        }
+    } catch {
+        # Key absent means WDigest is disabled by default on Server 2012 R2+ when KB2871997 applied
+        # On older systems absence may mean enabled — flag only if OS is below 2012 R2
+        $osCaption = (Get-WmiObject Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
+        if ($osCaption -match '2008|2003|Windows 7|Windows Vista|Windows XP') {
+            $msg = "WDigest registry key absent on legacy OS ($osCaption) — WDigest may be active by default on $env:COMPUTERNAME"
+            Write-Both "    [!] $msg"
+            $findings += $msg
+        } else {
+            Write-Both "    [+] WDigest registry key absent — disabled by default on $env:COMPUTERNAME"
+        }
+    }
+
+    # --- LSA Protection (RunAsPPL) ---
+    $lsaPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
+    try {
+        $runAsPPL = (Get-ItemProperty -Path $lsaPath -Name 'RunAsPPL' -ErrorAction Stop).RunAsPPL
+        if ($runAsPPL -ge 1) {
+            Write-Both "    [+] LSA Protection (RunAsPPL) is enabled (value: $runAsPPL)"
+        } else {
+            $msg = "LSA Protection (RunAsPPL) is disabled (value: $runAsPPL) on $env:COMPUTERNAME — LSASS process is not protected"
+            Write-Both "    [!] $msg"
+            $findings += $msg
+        }
+    } catch {
+        $msg = "LSA Protection (RunAsPPL) registry key absent on $env:COMPUTERNAME — LSASS process is not protected"
+        Write-Both "    [!] $msg"
+        $findings += $msg
+    }
+
+    # --- Credential Guard (informational) ---
+    try {
+        $cgPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard'
+        $enableVBS = (Get-ItemProperty -Path $cgPath -Name 'EnableVirtualizationBasedSecurity' -ErrorAction Stop).EnableVirtualizationBasedSecurity
+        $cgFlags  = (Get-ItemProperty -Path $cgPath -Name 'RequirePlatformSecurityFeatures' -ErrorAction Stop).RequirePlatformSecurityFeatures
+        if ($enableVBS -eq 1) {
+            Write-Both "    [+] Virtualization Based Security (Credential Guard) is enabled"
+        } else {
+            $msg = "Virtualization Based Security (Credential Guard) is not enabled on $env:COMPUTERNAME"
+            Write-Both "    [!] $msg"
+            $findings += $msg
+        }
+    } catch {
+        Write-Both "    [~] Credential Guard / VBS registry keys not present on $env:COMPUTERNAME"
+    }
+
+    if ($findings.Count -gt 0) {
+        $evidencePath = "$outputdir\HostHardening.txt"
+        $findings | Set-Content -Path $evidencePath
+        Write-Nessus-Finding "Host Hardening Deficiencies" "KB732" ([System.IO.File]::ReadAllText($evidencePath))
+    } else {
+        Write-Both "    [+] No host hardening deficiencies found on $env:COMPUTERNAME"
+    }
+    Write-Both "    [-] Finished host hardening checks"
+}
+
 function Get-LDAPSecurity {
     # Check if LDAP signing is enabled
     $computerName = $env:COMPUTERNAME
@@ -2653,6 +2819,9 @@ $script:CheckRegistry = @{
     'KB501'  = @{ check_id='AD-IDENTITY-005';   category='identity';  severity='low';            confidence='high'; impact='low';      remediation_effort='low';    title='Disabled User Accounts Still in Domain';                  recommendation='Review and remove disabled accounts that are no longer needed. Clean up stale objects.' }
     'KB550'  = @{ check_id='AD-PWPOL-005';      category='policy';    severity='medium';         confidence='high'; impact='medium';   remediation_effort='medium'; title='User Accounts with Passwords Older Than 90 Days';         recommendation='Enforce password expiry policy. Identify accounts exceeding maximum password age.' }
     'KB253'  = @{ check_id='AD-IDENTITY-006';   category='identity';  severity='high';           confidence='high'; impact='high';     remediation_effort='low';    title='krbtgt Password Not Recently Changed';                    recommendation='Reset krbtgt password. Follow Microsoft guidance for krbtgt password rollover procedure.' }
+    'KB730'  = @{ check_id='AD-KERBEROS-001';  category='kerberos';  severity='critical';       confidence='high'; impact='critical'; remediation_effort='medium'; title='Unconstrained Kerberos Delegation Enabled';               recommendation='Remove unconstrained delegation from all non-DC accounts. Migrate to constrained or resource-based constrained delegation (RBCD).' }
+    'KB731'  = @{ check_id='AD-ACL-002';       category='acl';       severity='critical';       confidence='high'; impact='critical'; remediation_effort='medium'; title='Accounts with DCSync Rights (DS-Replication)';            recommendation='Remove DS-Replication-Get-Changes-All ACE from non-DC accounts. Only Domain Controllers should hold replication rights.' }
+    'KB732'  = @{ check_id='AD-HOSTHARDENING-001'; category='hardening'; severity='high';       confidence='high'; impact='high';     remediation_effort='low';    title='Host Hardening Deficiencies (WDigest / LSA Protection)';  recommendation='Disable WDigest authentication (HKLM:\SYSTEM\...\WDigest UseLogonCredential=0) and enable LSA Protection (RunAsPPL=1) via GPO.' }
 }
 
 # --- Default per-module timeouts (seconds) ---
@@ -2676,15 +2845,18 @@ $script:DefaultModuleTimeouts = @{
     adcs            = 60
     ldapsecurity    = 60
     securityevents  = 120
+    kerbdelegation  = 90
+    dcsync          = 120
+    hosthardening   = 60
 }
 
 # --- Profile definitions (profile name  ordered list of module names) ---
 $script:Profiles = @{
     'light'          = @('hostdetails', 'accounts', 'passwordpolicy', 'ldapsecurity')
-    'standard'       = @('hostdetails', 'domainaudit', 'trusts', 'accounts', 'passwordpolicy', 'oldboxes', 'gpo', 'laps', 'insecurednszone', 'recentchanges', 'spn', 'asrep', 'ldapsecurity')
-    'deep'           = @('hostdetails', 'domainaudit', 'trusts', 'accounts', 'passwordpolicy', 'oldboxes', 'gpo', 'ouperms', 'laps', 'authpolsilos', 'insecurednszone', 'recentchanges', 'spn', 'asrep', 'acl', 'adcs', 'ldapsecurity', 'ntds')
-    'evidence'       = @('hostdetails', 'domainaudit', 'trusts', 'accounts', 'passwordpolicy', 'oldboxes', 'gpo', 'ouperms', 'laps', 'authpolsilos', 'insecurednszone', 'recentchanges', 'spn', 'asrep', 'acl', 'adcs', 'ldapsecurity')
-    'incident-response' = @('hostdetails', 'domainaudit', 'trusts', 'accounts', 'passwordpolicy', 'oldboxes', 'gpo', 'ouperms', 'laps', 'authpolsilos', 'insecurednszone', 'recentchanges', 'spn', 'asrep', 'acl', 'adcs', 'ldapsecurity', 'securityevents')
+    'standard'       = @('hostdetails', 'domainaudit', 'trusts', 'accounts', 'passwordpolicy', 'oldboxes', 'gpo', 'laps', 'insecurednszone', 'recentchanges', 'spn', 'asrep', 'kerbdelegation', 'hosthardening', 'ldapsecurity')
+    'deep'           = @('hostdetails', 'domainaudit', 'trusts', 'accounts', 'passwordpolicy', 'oldboxes', 'gpo', 'ouperms', 'laps', 'authpolsilos', 'insecurednszone', 'recentchanges', 'spn', 'asrep', 'kerbdelegation', 'dcsync', 'hosthardening', 'acl', 'adcs', 'ldapsecurity', 'ntds')
+    'evidence'       = @('hostdetails', 'domainaudit', 'trusts', 'accounts', 'passwordpolicy', 'oldboxes', 'gpo', 'ouperms', 'laps', 'authpolsilos', 'insecurednszone', 'recentchanges', 'spn', 'asrep', 'kerbdelegation', 'dcsync', 'hosthardening', 'acl', 'adcs', 'ldapsecurity')
+    'incident-response' = @('hostdetails', 'domainaudit', 'trusts', 'accounts', 'passwordpolicy', 'oldboxes', 'gpo', 'ouperms', 'laps', 'authpolsilos', 'insecurednszone', 'recentchanges', 'spn', 'asrep', 'kerbdelegation', 'dcsync', 'hosthardening', 'acl', 'adcs', 'ldapsecurity', 'securityevents')
     'inventory-only' = @('hostdetails', 'domainaudit', 'accounts', 'oldboxes')
 }
 
@@ -4087,10 +4259,16 @@ if ($preflight.IsPresent) {
 }
 
 # Banner
-Write-Both "+====================================================================+"
-Write-Both "|       LZ-ADaudit - Active Directory Security Assessment            |"
-Write-Both "|       Lazarus Security Framework  |  $versionnum                           |"
-Write-Both "+====================================================================+"
+Write-Both ""
+Write-Both "  ██╗     ███████╗      █████╗ ██████╗  █████╗ ██╗   ██╗██████╗ ██╗████████╗"
+Write-Both "  ██║     ╚══███╔╝     ██╔══██╗██╔══██╗██╔══██╗██║   ██║██╔══██╗██║╚══██╔══╝"
+Write-Both "  ██║       ███╔╝      ███████║██║  ██║███████║██║   ██║██║  ██║██║   ██║   "
+Write-Both "  ██║      ███╔╝       ██╔══██║██║  ██║██╔══██║██║   ██║██║  ██║██║   ██║   "
+Write-Both "  ███████╗███████╗     ██║  ██║██████╔╝██║  ██║╚██████╔╝██████╔╝██║   ██║   "
+Write-Both "  ╚══════╝╚══════╝     ╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝   ╚═╝   "
+Write-Both ""
+Write-Both "  Active Directory Security Assessment  |  Lazarus Security Framework  |  $versionnum"
+Write-Both "  ─────────────────────────────────────────────────────────────────────────────────"
 Write-Both ""
 
 $running = $false
@@ -4288,6 +4466,21 @@ if ($modulesToRun.Contains('asrep')) {
     Invoke-AuditModule -Name 'asrep' -DisplayName 'AS-REP Roasting' -Code { Get-ADUsersWithoutPreAuth } `
                        -TimeoutSeconds (Get-ModuleTimeout 'asrep')
 }
+if ($modulesToRun.Contains('kerbdelegation')) {
+    $running = $true ; Write-Both "[*] Check For Unconstrained Kerberos Delegation"
+    Invoke-AuditModule -Name 'kerbdelegation' -DisplayName 'Unconstrained Kerberos Delegation' -Code { Get-UnconstrainedDelegation } `
+                       -TimeoutSeconds (Get-ModuleTimeout 'kerbdelegation')
+}
+if ($modulesToRun.Contains('dcsync')) {
+    $running = $true ; Write-Both "[*] Check For Accounts with DCSync Rights"
+    Invoke-AuditModule -Name 'dcsync' -DisplayName 'DCSync Rights' -Code { Get-DCSyncRights } `
+                       -TimeoutSeconds (Get-ModuleTimeout 'dcsync')
+}
+if ($modulesToRun.Contains('hosthardening')) {
+    $running = $true ; Write-Both "[*] Check Host Hardening Settings (WDigest / LSA Protection)"
+    Invoke-AuditModule -Name 'hosthardening' -DisplayName 'Host Hardening Checks' -Code { Get-HostHardeningChecks } `
+                       -TimeoutSeconds (Get-ModuleTimeout 'hosthardening')
+}
 if ($modulesToRun.Contains('acl')) {
     $running = $true ; Write-Both "[*] Check For Dangerous ACL Permissions"
     Invoke-AuditModule -Name 'acl' -DisplayName 'Dangerous ACL Permissions' -Code { Find-DangerousACLPermissions } `
@@ -4332,6 +4525,9 @@ if (-not $running) {
     Write-Both "    -recentchanges    newly created users and groups (last 30 days)"
     Write-Both "    -spn              high-value kerberoastable accounts"
     Write-Both "    -asrep            AS-REP roastable accounts"
+    Write-Both "    -kerbdelegation   unconstrained Kerberos delegation (users and computers, excl. DCs)"
+    Write-Both "    -dcsync           accounts with DCSync rights (DS-Replication-Get-Changes-All)"
+    Write-Both "    -hosthardening    WDigest credential caching, LSA Protection (RunAsPPL), Credential Guard"
     Write-Both "    -acl              dangerous ACL permissions on computers/users/groups"
     Write-Both "    -adcs             ADCS vulnerabilities (ESC1-4, ESC8)"
     Write-Both "    -ldapsecurity     LDAP signing, LDAPS, channel binding, null sessions"
