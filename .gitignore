@@ -1,0 +1,20 @@
+# Claude Code local settings (may contain internal paths/permissions)
+.claude/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Report output files (generated, not source)
+*.xlsx
+report*.html
+
+# Audit output folders (timestamped)
+*_2026*/
+*_audit_*/
+
+# Windows
+Thumbs.db
+desktop.ini
