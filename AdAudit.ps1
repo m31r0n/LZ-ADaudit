@@ -297,7 +297,7 @@ Function Get-OUPerms {
         if ($totalcount -eq 0) { break }
         $progresscount++
         Write-Progress -Activity "Searching for non standard permissions for authenticated users..." -Status "Currently identifed $count" -PercentComplete ($progresscount / $totalcount * 100)
-        if ($OSVersion -like "Windows Server 2019*" -or $OSVersion -like "Windows Server 2022*") {
+        if ($OSVersion -like "Windows Server 2019*" -or $OSVersion -like "Windows Server 2022*" -or $OSVersion -like "Windows Server 2025*") {
             $output = (Get-Acl -Path "Microsoft.ActiveDirectory.Management.dll\ActiveDirectory:://RootDSE/$object").Access | Where-Object { ($_.IdentityReference -eq "$AuthenticatedUsers") -or ($_.IdentityReference -eq "$EveryOne") -or ($_.IdentityReference -like "*\$DomainUsers") -or ($_.IdentityReference -eq "BUILTIN\$Users") } | Where-Object { ($_.ActiveDirectoryRights -ne 'GenericRead') -and ($_.ActiveDirectoryRights -ne 'GenericExecute') -and ($_.ActiveDirectoryRights -ne 'ExtendedRight') -and ($_.ActiveDirectoryRights -ne 'ReadControl') -and ($_.ActiveDirectoryRights -ne 'ReadProperty') -and ($_.ActiveDirectoryRights -ne 'ListObject') -and ($_.ActiveDirectoryRights -ne 'ListChildren') -and ($_.ActiveDirectoryRights -ne 'ListChildren, ReadProperty, ListObject') -and ($_.ActiveDirectoryRights -ne 'ReadProperty, GenericExecute') -and ($_.AccessControlType -ne 'Deny') }
         }
         else {
@@ -2473,7 +2473,7 @@ function Find-DangerousACLPermissions {
     # Find dangerous permissions on Computers
     $computers = Get-ADObject -Filter { objectClass -eq 'computer' -and objectCategory -eq 'computer' } -Properties *
     $computerResults = foreach ($computer in $computers) {
-        if ($OSVersion -like "Windows Server 2019*" -or $OSVersion -like "Windows Server 2022*") {
+        if ($OSVersion -like "Windows Server 2019*" -or $OSVersion -like "Windows Server 2022*" -or $OSVersion -like "Windows Server 2025*") {
 	$acl = Get-Acl -Path "Microsoft.ActiveDirectory.Management.dll\ActiveDirectory:://RootDSE/$($computer.DistinguishedName)"} else {
 	$acl = Get-Acl AD:\$computer}
 
@@ -2496,7 +2496,7 @@ function Find-DangerousACLPermissions {
     # Find dangerous permissions on groups
     $groups = Get-ADObject -Filter { objectClass -eq 'group' -and objectCategory -eq 'group' } -Properties *
     $groupResults = foreach ($group in $groups) {
-        if ($OSVersion -like "Windows Server 2019*" -or $OSVersion -like "Windows Server 2022*") {
+        if ($OSVersion -like "Windows Server 2019*" -or $OSVersion -like "Windows Server 2022*" -or $OSVersion -like "Windows Server 2025*") {
 	$acl = Get-Acl -Path "Microsoft.ActiveDirectory.Management.dll\ActiveDirectory:://RootDSE/$($group.DistinguishedName)"} else {
 	$acl = Get-Acl AD:\$group}
 
@@ -2521,7 +2521,7 @@ function Find-DangerousACLPermissions {
     $userResults = foreach ($user in $users) {
         $acl = $null
 
-        if ($OSVersion -like "Windows Server 2019*" -or $OSVersion -like "Windows Server 2022*") {
+        if ($OSVersion -like "Windows Server 2019*" -or $OSVersion -like "Windows Server 2022*" -or $OSVersion -like "Windows Server 2025*") {
 	$acl = Get-Acl -Path "Microsoft.ActiveDirectory.Management.dll\ActiveDirectory:://RootDSE/$($user.DistinguishedName)"} else {
 	$acl = Get-Acl AD:\$user}
 
@@ -2940,7 +2940,7 @@ function Invoke-AuditModule {
                 $payload = $null
                 foreach ($item in $received) {
                     if ($null -eq $item) { continue }
-                    if ($item.PSObject.Properties.Name -contains 'status') {
+                    if ($null -ne $item.PSObject.Properties['status']) {
                         $payload = [PSCustomObject]@{
                             status   = $item.status
                             error    = $item.error
