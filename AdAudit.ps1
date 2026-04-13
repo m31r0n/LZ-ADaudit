@@ -652,7 +652,8 @@ Function Get-PrivilegedGroupAccounts {
 Function Get-ProtectedUsers {
     #Lists users in "Protected Users" group (2012R2 and above)
     $DomainLevel = (Get-ADDomain).domainMode
-    if ($DomainLevel -eq "Windows2012Domain" -or $DomainLevel -eq "Windows2012R2Domain" -or $DomainLevel -eq "Windows2016Domain") {
+    $supportedDFL = @("Windows2012Domain","Windows2012R2Domain","Windows2016Domain","Windows2019Domain","Windows2022Domain","Windows2025Domain")
+    if ([string]$DomainLevel -in $supportedDFL) {
         #Checking for 2012 or above domain functional level
         $ProtectedUsersSID = ((Get-ADDomain -Current LoggedOnUser).domainsid.value) + "-525"
         $ProtectedUsers = (Get-ADGroup -Identity $ProtectedUsersSID).SamAccountName
@@ -1438,7 +1439,17 @@ Function Get-DefaultDomainControllersPolicy {
     $ExcessiveDCTimePermissions = $false
     $ExcessiveDCBatchLogonPermissions = $false
     $ExcessiveDCRDPLogonPermissions = $false
-    $GPO = Get-GPO 'Default Domain Controllers Policy'
+    try {
+        $GPO = Get-GPO 'Default Domain Controllers Policy' -ErrorAction Stop
+    } catch {
+        try {
+            # Well-known GUID for Default Domain Controllers Policy (locale-independent)
+            $GPO = Get-GPO -Guid '6AC1786C-016F-11D2-945F-00C04fB984F9' -ErrorAction Stop
+        } catch {
+            Write-Both "    [!] Default Domain Controllers Policy GPO not found by name or GUID. Skipping DC policy audit."
+            return
+        }
+    }
     $GPOreport = Get-GPOReport -Guid $GPO.Id -ReportType Xml
     #Interactive local logon
     $permissionindex = $GPOreport.IndexOf('SeInteractiveLogonRight')
