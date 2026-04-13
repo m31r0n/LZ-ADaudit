@@ -268,6 +268,30 @@ Function Escape-XmlSpecialCharacters {
 
     return $Value
 }
+Function Get-ADAclSafe {
+    # Resolve AD ACL with resilient provider path fallback.
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DistinguishedName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($DistinguishedName)) { return $null }
+
+    $paths = @(
+        "Microsoft.ActiveDirectory.Management.dll\ActiveDirectory:://RootDSE/$DistinguishedName",
+        "AD:\$DistinguishedName",
+        "AD:$DistinguishedName"
+    )
+
+    foreach ($p in $paths) {
+        try {
+            $acl = Get-Acl -Path $p -ErrorAction Stop
+            if ($acl) { return $acl }
+        } catch {}
+    }
+
+    return $null
+}
 Function Get-DNSZoneInsecure {
     #Check DNS zones allowing insecure updates
     if ($OSVersion -notlike "Windows Server 2008*") {
@@ -299,10 +323,27 @@ Function Get-OUPerms {
         Write-Progress -Activity "Searching for non standard permissions for authenticated users..." -Status "Currently identifed $count" -PercentComplete ($progresscount / $totalcount * 100)
         $output = $null
         try {
-            if ($OSVersion -like "Windows Server 2019*" -or $OSVersion -like "Windows Server 2022*" -or $OSVersion -like "Windows Server 2025*") {
-                $output = (Get-Acl -Path "Microsoft.ActiveDirectory.Management.dll\ActiveDirectory:://RootDSE/$($object.DistinguishedName)").Access | Where-Object { ($_.IdentityReference -eq "$AuthenticatedUsers") -or ($_.IdentityReference -eq "$EveryOne") -or ($_.IdentityReference -like "*\$DomainUsers") -or ($_.IdentityReference -eq "BUILTIN\$Users") } | Where-Object { ($_.ActiveDirectoryRights -ne 'GenericRead') -and ($_.ActiveDirectoryRights -ne 'GenericExecute') -and ($_.ActiveDirectoryRights -ne 'ExtendedRight') -and ($_.ActiveDirectoryRights -ne 'ReadControl') -and ($_.ActiveDirectoryRights -ne 'ReadProperty') -and ($_.ActiveDirectoryRights -ne 'ListObject') -and ($_.ActiveDirectoryRights -ne 'ListChildren') -and ($_.ActiveDirectoryRights -ne 'ListChildren, ReadProperty, ListObject') -and ($_.ActiveDirectoryRights -ne 'ReadProperty, GenericExecute') -and ($_.AccessControlType -ne 'Deny') }
-            } else {
-                $output = (Get-Acl "AD:$($object.DistinguishedName)").Access | Where-Object { ($_.IdentityReference -eq "$AuthenticatedUsers") -or ($_.IdentityReference -eq "$EveryOne") -or ($_.IdentityReference -like "*\$DomainUsers") -or ($_.IdentityReference -eq "BUILTIN\$Users") } | Where-Object { ($_.ActiveDirectoryRights -ne 'GenericRead') -and ($_.ActiveDirectoryRights -ne 'GenericExecute') -and ($_.ActiveDirectoryRights -ne 'ExtendedRight') -and ($_.ActiveDirectoryRights -ne 'ReadControl') -and ($_.ActiveDirectoryRights -ne 'ReadProperty') -and ($_.ActiveDirectoryRights -ne 'ListObject') -and ($_.ActiveDirectoryRights -ne 'ListChildren') -and ($_.ActiveDirectoryRights -ne 'ListChildren, ReadProperty, ListObject') -and ($_.ActiveDirectoryRights -ne 'ReadProperty, GenericExecute') -and ($_.AccessControlType -ne 'Deny') }
+            $aclObject = Get-ADAclSafe -DistinguishedName $object.DistinguishedName
+            if ($aclObject) {
+                $output = $aclObject.Access |
+                    Where-Object {
+                        ($_.IdentityReference -eq "$AuthenticatedUsers") -or
+                        ($_.IdentityReference -eq "$EveryOne") -or
+                        ($_.IdentityReference -like "*\$DomainUsers") -or
+                        ($_.IdentityReference -eq "BUILTIN\$Users")
+                    } |
+                    Where-Object {
+                        ($_.ActiveDirectoryRights -ne 'GenericRead') -and
+                        ($_.ActiveDirectoryRights -ne 'GenericExecute') -and
+                        ($_.ActiveDirectoryRights -ne 'ExtendedRight') -and
+                        ($_.ActiveDirectoryRights -ne 'ReadControl') -and
+                        ($_.ActiveDirectoryRights -ne 'ReadProperty') -and
+                        ($_.ActiveDirectoryRights -ne 'ListObject') -and
+                        ($_.ActiveDirectoryRights -ne 'ListChildren') -and
+                        ($_.ActiveDirectoryRights -ne 'ListChildren, ReadProperty, ListObject') -and
+                        ($_.ActiveDirectoryRights -ne 'ReadProperty, GenericExecute') -and
+                        ($_.AccessControlType -ne 'Deny')
+                    }
             }
         } catch { $output = $null }
         if ($output -ne $null) {
@@ -2475,14 +2516,7 @@ function Find-DangerousACLPermissions {
     # Find dangerous permissions on Computers
     $computers = Get-ADObject -Filter { objectClass -eq 'computer' -and objectCategory -eq 'computer' } -Properties *
     $computerResults = foreach ($computer in $computers) {
-        $acl = $null
-        try {
-            if ($OSVersion -like "Windows Server 2019*" -or $OSVersion -like "Windows Server 2022*" -or $OSVersion -like "Windows Server 2025*") {
-                $acl = Get-Acl -Path "Microsoft.ActiveDirectory.Management.dll\ActiveDirectory:://RootDSE/$($computer.DistinguishedName)"
-            } else {
-                $acl = Get-Acl "AD:$($computer.DistinguishedName)"
-            }
-        } catch { $acl = $null }
+        $acl = Get-ADAclSafe -DistinguishedName $computer.DistinguishedName
         $dangerousRules = if ($acl) { $acl.Access | Where-Object { $_.ActiveDirectoryRights -in $dangerousAces -and $_.IdentityReference -in $groupsToCheck } } else { $null }
 
         if ($dangerousRules) {
@@ -2502,14 +2536,7 @@ function Find-DangerousACLPermissions {
     # Find dangerous permissions on groups
     $groups = Get-ADObject -Filter { objectClass -eq 'group' -and objectCategory -eq 'group' } -Properties *
     $groupResults = foreach ($group in $groups) {
-        $acl = $null
-        try {
-            if ($OSVersion -like "Windows Server 2019*" -or $OSVersion -like "Windows Server 2022*" -or $OSVersion -like "Windows Server 2025*") {
-                $acl = Get-Acl -Path "Microsoft.ActiveDirectory.Management.dll\ActiveDirectory:://RootDSE/$($group.DistinguishedName)"
-            } else {
-                $acl = Get-Acl "AD:$($group.DistinguishedName)"
-            }
-        } catch { $acl = $null }
+        $acl = Get-ADAclSafe -DistinguishedName $group.DistinguishedName
         $dangerousRules = if ($acl) { $acl.Access | Where-Object { $_.ActiveDirectoryRights -in $dangerousAces -and $_.IdentityReference -in $groupsToCheck } } else { $null }
 
         if ($dangerousRules) {
@@ -2529,15 +2556,7 @@ function Find-DangerousACLPermissions {
     $users = Get-ADObject -Filter { objectClass -eq 'user' -and objectCategory -eq 'person' } -Properties *
 
     $userResults = foreach ($user in $users) {
-        $acl = $null
-
-        try {
-            if ($OSVersion -like "Windows Server 2019*" -or $OSVersion -like "Windows Server 2022*" -or $OSVersion -like "Windows Server 2025*") {
-                $acl = Get-Acl -Path "Microsoft.ActiveDirectory.Management.dll\ActiveDirectory:://RootDSE/$($user.DistinguishedName)"
-            } else {
-                $acl = Get-Acl "AD:$($user.DistinguishedName)"
-            }
-        } catch { $acl = $null }
+        $acl = Get-ADAclSafe -DistinguishedName $user.DistinguishedName
 
         if ($acl) {
             $dangerousRules = $acl.Access | Where-Object { $_.ActiveDirectoryRights -in $dangerousAces -and $_.IdentityReference -in $groupsToCheck }
