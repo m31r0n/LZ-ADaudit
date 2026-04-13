@@ -2879,7 +2879,7 @@ function Invoke-AuditModule {
 
                 try {
                     $rawScript = Get-Content -Path $ScriptPath -Raw -Encoding UTF8 -ErrorAction Stop
-                    $parts = [regex]::Split($rawScript, '(?m)^#\\s+MAIN EXECUTION\\s*$', 2)
+                    $parts = [regex]::Split($rawScript, '(?m)^#\s+MAIN EXECUTION\s*$', 2)
                     if ($parts.Count -lt 2) { throw "Could not isolate function section from script source." }
                     . ([scriptblock]::Create($parts[0]))
                     $outputdir         = $OutputDir
@@ -4083,6 +4083,7 @@ if (Get-Module -ListAvailable -Name DSInternals) {
     $script:capabilities['DSInternals'] = $false
 }
 $script:capabilities['ActiveDirectory'] = $true
+$script:capabilities['AD']              = $true
 $script:capabilities['GroupPolicy']     = $true
 $script:capabilities['ServerManager']   = $true
 $script:capabilities['AdmPwdPS']        = [bool](Get-Module -ListAvailable -Name AdmPwd.PS)
