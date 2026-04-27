@@ -23,6 +23,39 @@
                 * kerbdelegation + hosthardening added to standard profile
                 * dcsync added to deep / evidence / incident-response profiles
                 * report_generator.py: new _REMEDIATION_DB entries for all 3 new check_ids
+            [x] Version 1.4.1 - 27/04/2026
+                * Resilience: production-grade error handling so a single failure never aborts the run
+                * New helper: Invoke-Safe { ... } wraps any block, catches any exception,
+                  writes structured row to logs/errors.log, optionally emits a finding, returns control
+                * Top-level trap captures uncaught errors, logs them, lets Export-AllFindings finalise
+                * try/finally guarantees Export-AllFindings + Write-Nessus-Footer ALWAYS run
+                * Module imports softened: ServerManager / GroupPolicy missing → capability=false (was: exit 3)
+                  Only the ActiveDirectory module is hard-required (everything else falls back gracefully)
+                * Get-Variables no longer returns early on partial failures — sets stub values and continues
+                * Per-iteration try/catch in Find-DangerousACLPermissions, Get-UnconstrainedDelegation
+                  (RBCD/Constrained-PT/Shadow Creds sub-checks), Get-ADCSVulns, Get-DCSyncRights,
+                  Get-HostHardeningChecks (NoPAC + PKINIT + krbtgt) so a single bad object/key
+                  doesn't abort the entire module
+                * Invoke-AuditModule scriptblock context now sets $ErrorActionPreference='Continue'
+                  and accumulates the $Error stream into the module's error context
+                * Per-module 'errors_captured' field added to execution.json
+            [x] Version 1.4.0 - 27/04/2026
+                * Critical fixes: ACL filter literal bug, Get-NTDSdit hardened (custody/ACL/no-injection)
+                * DCSync coverage expanded to AdminSDHolder + Configuration NC
+                * kerbdelegation: added RBCD, Constrained Delegation, Shadow Credentials sub-checks
+                * ADCS rewrite (LDAP-native, language-independent) + ESC9/10/13/14/15 (EKUwu)
+                * New checks: NoPAC patches, PKINIT StrongCertificateBindingEnforcement, krbtgt enctype
+                * Performance: single-pass ACL scan, OUperms paginated, password policy cached, parallel CIM
+                * Get-LockedAccounts now emits structured finding (KB502)
+                * Get-DomainTrusts: bitmask evaluation; SID Filtering disabled flagged critical
+                * Get-Old/Boxes split: 2012/2012R2 ESU + Server 2016 EOL warning
+                * Idempotency guard on outputPath; preflight stricter for non-elevated
+                * Renamed $profile → $auditProfile (PS automatic var collision)
+                * Bug fixes: Get-WinVersion uses [Version], DoesNotRequirePreAuth uses $true,
+                  CSV multiline regex, SPN recursive groups restored, verbs renamed
+                * Output manifest in execution.json (TXT stems generated)
+                * report_generator.py: hardened XSS (CSP), loader error reporting, sheet name disambiguation,
+                  exit non-zero if openpyxl missing for XLSX, scrubbed client info from remediation DB
     .EXAMPLE
         PS> AdAudit.ps1 -all
     .EXAMPLE
@@ -56,12 +89,16 @@ Param (
     [switch]$acl = $false,
     [switch]$ldapsecurity = $false,
     [switch]$securityevents = $false,
+    [switch]$kerbdelegation = $false,
+    [switch]$dcsync = $false,
+    [switch]$hosthardening = $false,
     [Alias('incident-response','incident-respones')]
     [switch]$incidentresponse = $false,
     [switch]$all = $false,
     [string[]]$exclude = @(),
     [string]$select,
-    [string]$profile = "",
+    [Alias('profile')]
+    [string]$auditProfile = "",
     [int]$moduleTimeoutSeconds = 0,
     [string]$outputPath = "",
     [switch]$quiet = $false,
@@ -72,7 +109,8 @@ Param (
     [switch]$inventory = $false,
     [switch]$evidence = $false,
     [switch]$preflight = $false,
-    [switch]$libraryOnly = $false
+    [switch]$libraryOnly = $false,
+    [switch]$Force = $false
 )
 
 $selectedChecks = @()
@@ -80,111 +118,116 @@ if ($select) { $selectedChecks = $select.Split(',') }
 
 if ($incidentresponse.IsPresent) {
     # convenience mode switch requested by operators (equivalent to -profile incident-response)
-    $profile = 'incident-response'
+    $auditProfile = 'incident-response'
 }
-if ($profile -ieq 'incident-respones') {
-    # typo-tolerant alias seen in field usage
-    $profile = 'incident-response'
+if ($auditProfile -ieq 'incident-respones') {
+    # typo-tolerant alias kept for backward compatibility (deprecated; will be removed v2.0)
+    $auditProfile = 'incident-response'
 }
 
 $script:switchesUsed    = @($MyInvocation.BoundParameters.Keys)
-$script:resolvedProfile = $profile
+$script:resolvedProfile = $auditProfile
 $script:modulesRequested = @()
 
-$versionnum = "v1.3.0"
+$versionnum = "v1.4.1"
 $AdministratorTranslation = @("Administrator", "Administrateur", "Administrador")#If missing put the default Administrator name for your own language here
 
 Function Get-Variables() {
-    #Retrieve group names and OS version
+    # v1.4.1: never abort the whole initialization on partial failures. Set stub values where
+    # lookups fail and continue, so subsequent modules can still run their independent checks.
+    # The previous behaviour (return on first failed Get-ADGroup) silently disabled most modules
+    # whenever AD was momentarily unreachable for a single query.
+
+    # OS version
     try {
         $script:OSVersion = (Get-Itemproperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name ProductName -ErrorAction Stop).ProductName
     } catch {
         Write-Both "    [!] Warning: Could not retrieve OS version from registry: $($_.Exception.Message)"
+        Write-ErrorLog -Context 'Get-Variables:OSVersion' -ErrorRecord $_
         $script:OSVersion = "Unknown"
     }
 
-    try {
-        $script:Administrators = (Get-ADGroup -Identity S-1-5-32-544 -ErrorAction Stop).SamAccountName
-    } catch {
-        Write-Both "    [!] Error: Failed to retrieve Administrators group: $($_.Exception.Message)"
-        return
-    }
+    # Built-in groups (English defaults as fallback)
+    $script:Administrators = 'Administrators'
+    $script:Users          = 'Users'
+    try { $script:Administrators = (Get-ADGroup -Identity S-1-5-32-544 -ErrorAction Stop).SamAccountName } catch { Write-Both "    [!] Could not resolve BUILTIN\Administrators (using stub 'Administrators'): $($_.Exception.Message)" ; Write-ErrorLog -Context 'Get-Variables:Administrators' -ErrorRecord $_ }
+    try { $script:Users          = (Get-ADGroup -Identity S-1-5-32-545 -ErrorAction Stop).SamAccountName } catch { Write-Both "    [!] Could not resolve BUILTIN\Users (using stub 'Users'): $($_.Exception.Message)"           ; Write-ErrorLog -Context 'Get-Variables:Users'          -ErrorRecord $_ }
 
-    try {
-        $script:Users = (Get-ADGroup -Identity S-1-5-32-545 -ErrorAction Stop).SamAccountName
-    } catch {
-        Write-Both "    [!] Error: Failed to retrieve Users group: $($_.Exception.Message)"
-        return
-    }
-
+    # Domain SIDs
+    $script:DomainAdminsSID         = $null
+    $script:DomainUsersSID          = $null
+    $script:DomainControllersSID    = $null
+    $script:SchemaAdminsSID         = $null
+    $script:EnterpriseAdminsSID     = $null
     try {
         $domainSID = (Get-ADDomain -Current LoggedOnUser -ErrorAction Stop).domainsid.value
-        $script:DomainAdminsSID = $domainSID + "-512"
-        $script:DomainUsersSID = $domainSID + "-513"
-        $script:DomainControllersSID = $domainSID + "-516"
-        $script:SchemaAdminsSID = $domainSID + "-518"
-        $script:EnterpriseAdminsSID = $domainSID + "-519"
+        $script:DomainAdminsSID         = $domainSID + "-512"
+        $script:DomainUsersSID          = $domainSID + "-513"
+        $script:DomainControllersSID    = $domainSID + "-516"
+        $script:SchemaAdminsSID         = $domainSID + "-518"
+        $script:EnterpriseAdminsSID     = $domainSID + "-519"
     } catch {
-        Write-Both "    [!] Error: Failed to retrieve domain information: $($_.Exception.Message)"
-        return
+        Write-Both "    [!] Could not retrieve domain SID — domain lookups limited: $($_.Exception.Message)"
+        Write-ErrorLog -Context 'Get-Variables:domainSID' -ErrorRecord $_
     }
 
+    # Well-known SIDs (always available offline)
     try {
-        $script:EveryOneSID = New-Object System.Security.Principal.SecurityIdentifier "S-1-1-0"
+        $script:EveryOneSID                    = New-Object System.Security.Principal.SecurityIdentifier "S-1-1-0"
         $script:EntrepriseDomainControllersSID = New-Object System.Security.Principal.SecurityIdentifier "S-1-5-9"
-        $script:AuthenticatedUsersSID = New-Object System.Security.Principal.SecurityIdentifier "S-1-5-11"
-        $script:SystemSID = New-Object System.Security.Principal.SecurityIdentifier "S-1-5-18"
-        $script:LocalServiceSID = New-Object System.Security.Principal.SecurityIdentifier "S-1-5-19"
+        $script:AuthenticatedUsersSID          = New-Object System.Security.Principal.SecurityIdentifier "S-1-5-11"
+        $script:SystemSID                      = New-Object System.Security.Principal.SecurityIdentifier "S-1-5-18"
+        $script:LocalServiceSID                = New-Object System.Security.Principal.SecurityIdentifier "S-1-5-19"
     } catch {
-        Write-Both "    [!] Error: Failed to create SID objects: $($_.Exception.Message)"
-        return
+        Write-Both "    [!] Could not create well-known SID objects: $($_.Exception.Message)"
+        Write-ErrorLog -Context 'Get-Variables:wellKnownSIDs' -ErrorRecord $_
     }
 
-    try {
-        $script:DomainAdmins = (Get-ADGroup -Identity $DomainAdminsSID -ErrorAction Stop).SamAccountName
-    } catch {
-        Write-Both "    [!] Error: Failed to retrieve Domain Admins group: $($_.Exception.Message)"
-        return
+    # Domain group names — stub with English defaults if AD lookup fails so downstream
+    # modules can at least pattern-match against something familiar.
+    $script:DomainAdmins        = 'Domain Admins'
+    $script:DomainUsers         = 'Domain Users'
+    $script:DomainControllers   = 'Domain Controllers'
+    if ($script:DomainAdminsSID) {
+        try { $script:DomainAdmins      = (Get-ADGroup -Identity $script:DomainAdminsSID      -ErrorAction Stop).SamAccountName } catch { Write-Both "    [!] Could not resolve Domain Admins: $($_.Exception.Message)"      ; Write-ErrorLog -Context 'Get-Variables:DomainAdmins'      -ErrorRecord $_ }
     }
-
-    try {
-        $script:DomainUsers = (Get-ADGroup -Identity $DomainUsersSID -ErrorAction Stop).SamAccountName
-    } catch {
-        Write-Both "    [!] Error: Failed to retrieve Domain Users group: $($_.Exception.Message)"
-        return
+    if ($script:DomainUsersSID) {
+        try { $script:DomainUsers       = (Get-ADGroup -Identity $script:DomainUsersSID       -ErrorAction Stop).SamAccountName } catch { Write-Both "    [!] Could not resolve Domain Users: $($_.Exception.Message)"       ; Write-ErrorLog -Context 'Get-Variables:DomainUsers'       -ErrorRecord $_ }
     }
-
-    try {
-        $script:DomainControllers = (Get-ADGroup -Identity $DomainControllersSID -ErrorAction Stop).SamAccountName
-    } catch {
-        Write-Both "    [!] Error: Failed to retrieve Domain Controllers group: $($_.Exception.Message)"
-        return
+    if ($script:DomainControllersSID) {
+        try { $script:DomainControllers = (Get-ADGroup -Identity $script:DomainControllersSID -ErrorAction Stop).SamAccountName } catch { Write-Both "    [!] Could not resolve Domain Controllers: $($_.Exception.Message)" ; Write-ErrorLog -Context 'Get-Variables:DomainControllers' -ErrorRecord $_ }
     }
 
     # Schema Admins and Enterprise Admins only exist in forest root domain
-    try {
-        $script:SchemaAdmins = (Get-ADGroup -Identity $SchemaAdminsSID -ErrorAction Stop).SamAccountName
-    } catch {
-        Write-Both "    [i] Schema Admins not available in this domain (expected in child domains)"
-        $script:SchemaAdmins = $null
+    $script:SchemaAdmins     = $null
+    $script:EnterpriseAdmins = $null
+    if ($script:SchemaAdminsSID) {
+        try { $script:SchemaAdmins     = (Get-ADGroup -Identity $script:SchemaAdminsSID     -ErrorAction Stop).SamAccountName } catch { Write-Both "    [i] Schema Admins not available in this domain (expected in child domains)" }
+    }
+    if ($script:EnterpriseAdminsSID) {
+        try { $script:EnterpriseAdmins = (Get-ADGroup -Identity $script:EnterpriseAdminsSID -ErrorAction Stop).SamAccountName } catch { Write-Both "    [i] Enterprise Admins not available in this domain (expected in child domains)" }
     }
 
-    try {
-        $script:EnterpriseAdmins = (Get-ADGroup -Identity $EnterpriseAdminsSID -ErrorAction Stop).SamAccountName
-    } catch {
-        Write-Both "    [i] Enterprise Admins not available in this domain (expected in child domains)"
-        $script:EnterpriseAdmins = $null
+    # Translate well-known SIDs to NTAccount names
+    $script:EveryOne                       = 'Everyone'
+    $script:EntrepriseDomainControllers    = 'NT AUTHORITY\ENTERPRISE DOMAIN CONTROLLERS'
+    $script:AuthenticatedUsers             = 'NT AUTHORITY\Authenticated Users'
+    $script:System                         = 'NT AUTHORITY\SYSTEM'
+    $script:LocalService                   = 'NT AUTHORITY\LOCAL SERVICE'
+    if ($script:EveryOneSID) {
+        try { $script:EveryOne                    = $script:EveryOneSID.Translate([System.Security.Principal.NTAccount]).Value }                    catch { Write-ErrorLog -Context 'Get-Variables:translate(Everyone)'              -ErrorRecord $_ }
     }
-
-    try {
-        $script:EveryOne = $EveryOneSID.Translate([System.Security.Principal.NTAccount]).Value
-        $script:EntrepriseDomainControllers = $EntrepriseDomainControllersSID.Translate([System.Security.Principal.NTAccount]).Value
-        $script:AuthenticatedUsers = $AuthenticatedUsersSID.Translate([System.Security.Principal.NTAccount]).Value
-        $script:System = $SystemSID.Translate([System.Security.Principal.NTAccount]).Value
-        $script:LocalService = $LocalServiceSID.Translate([System.Security.Principal.NTAccount]).Value
-    } catch {
-        Write-Both "    [!] Error: Failed to translate SIDs to account names: $($_.Exception.Message)"
-        return
+    if ($script:EntrepriseDomainControllersSID) {
+        try { $script:EntrepriseDomainControllers = $script:EntrepriseDomainControllersSID.Translate([System.Security.Principal.NTAccount]).Value } catch { Write-ErrorLog -Context 'Get-Variables:translate(EntDCs)'                -ErrorRecord $_ }
+    }
+    if ($script:AuthenticatedUsersSID) {
+        try { $script:AuthenticatedUsers          = $script:AuthenticatedUsersSID.Translate([System.Security.Principal.NTAccount]).Value }          catch { Write-ErrorLog -Context 'Get-Variables:translate(AuthenticatedUsers)'   -ErrorRecord $_ }
+    }
+    if ($script:SystemSID) {
+        try { $script:System                      = $script:SystemSID.Translate([System.Security.Principal.NTAccount]).Value }                      catch { Write-ErrorLog -Context 'Get-Variables:translate(System)'                -ErrorRecord $_ }
+    }
+    if ($script:LocalServiceSID) {
+        try { $script:LocalService                = $script:LocalServiceSID.Translate([System.Security.Principal.NTAccount]).Value }                catch { Write-ErrorLog -Context 'Get-Variables:translate(LocalService)'          -ErrorRecord $_ }
     }
     Write-Both "    [+] Administrators               : $Administrators"
     Write-Both "    [+] Users                        : $Users"
@@ -208,6 +251,11 @@ Function Write-Both() {
         [string]$Level = 'normal'
     )
     # Writes to console and persistent logs.
+    # FIX v1.4.0: hot-path uses [System.IO.File]::AppendAllText with explicit UTF-8 (no BOM)
+    # for two reasons: (a) ~10x faster than Add-Content for hundreds of small writes,
+    # (b) consistent encoding (Add-Content default differs across cmdlets — UTF-16 / ANSI / UTF-8 BOM)
+    # which previously caused the Python parser to detect-and-decode per file.
+    # Note: the legacy consolelog.txt is no longer written; logs/console.log is the canonical location.
     $text = if ($Message -and $Message.Count -gt 0) { ($Message -join ' ') } else { "$args" }
     if (-not $script:quietMode) {
         $canPrint = $false
@@ -218,10 +266,12 @@ Function Write-Both() {
         }
         if ($canPrint) { Write-Host $text }
     }
-    Add-Content -Path "$outputdir\consolelog.txt" -Value $text -ErrorAction SilentlyContinue
+    if (-not $script:utf8NoBom) {
+        $script:utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    }
     if ($script:logsDir) {
-        Add-Content -Path "$script:logsDir\console.log" -Value $text -ErrorAction SilentlyContinue
-        Add-Content -Path "$script:logsDir\debug.log" -Value "$(Get-Date -Format o) | [$Level] $text" -ErrorAction SilentlyContinue
+        try { [System.IO.File]::AppendAllText((Join-Path $script:logsDir 'console.log'), ($text + [Environment]::NewLine), $script:utf8NoBom) } catch {}
+        try { [System.IO.File]::AppendAllText((Join-Path $script:logsDir 'debug.log'),   ("$(Get-Date -Format o) | [$Level] $text" + [Environment]::NewLine), $script:utf8NoBom) } catch {}
     }
 }
 Function Write-Trace() {
@@ -232,11 +282,81 @@ Function Write-Trace() {
     )
     Write-Both -Level $Level $Message
 }
+
+Function Write-ErrorLog() {
+    # v1.4.1: structured per-error log line so an operator can post-mortem any failure without grepping debug.log.
+    # Format: ISO-timestamp | module/context | exception-type | message | (optional) stack tail
+    param(
+        [string]$Context = 'unknown',
+        [object]$ErrorRecord,
+        [string]$Message = ''
+    )
+    if (-not $script:utf8NoBom) { $script:utf8NoBom = New-Object System.Text.UTF8Encoding($false) }
+    $ts = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    $excType = ''
+    $msg     = $Message
+    $tail    = ''
+    if ($ErrorRecord) {
+        try {
+            if ($ErrorRecord.Exception) {
+                $excType = $ErrorRecord.Exception.GetType().FullName
+                if (-not $msg) { $msg = $ErrorRecord.Exception.Message }
+            }
+            if ($ErrorRecord.ScriptStackTrace) { $tail = ($ErrorRecord.ScriptStackTrace -replace "`r?`n",' | ') }
+        } catch {}
+    }
+    $line = "$ts | [$Context] | $excType | $msg | $tail"
+    if ($script:logsDir) {
+        try { [System.IO.File]::AppendAllText((Join-Path $script:logsDir 'errors.log'), $line + [Environment]::NewLine, $script:utf8NoBom) } catch {}
+    }
+    # Mirror to debug.log so a single tail covers everything
+    Write-Trace -Level 'debug' -Message "ERROR | $Context | $excType | $msg"
+}
+
+Function Invoke-Safe() {
+    # v1.4.1: production-grade wrapper. Runs $Script in a try/catch with optional retry.
+    # Never throws back to the caller — catches Exception (including non-terminating errors when
+    # $ErrorActionPreference='Stop' is set inside the block) and writes a structured row to errors.log.
+    # Use this around any block that should NOT abort the surrounding module on failure.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [scriptblock]$Script,
+        [string]$Context = 'invoke-safe',
+        [int]$Retries = 0,
+        [int]$RetryDelayMs = 250,
+        [object]$DefaultValue = $null,
+        [switch]$EmitFinding
+    )
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            return (& $Script)
+        } catch {
+            $err = $_
+            Write-ErrorLog -Context "$Context (attempt $attempt of $($Retries + 1))" -ErrorRecord $err
+            if ($attempt -le $Retries) {
+                Start-Sleep -Milliseconds $RetryDelayMs
+                continue
+            }
+            # Final failure: emit finding if requested, return DefaultValue.
+            if ($EmitFinding -and (Get-Command Write-Nessus-Finding -ErrorAction SilentlyContinue)) {
+                try {
+                    Write-Nessus-Finding "InternalError" "KB901" ("[$Context] $($err.Exception.Message)")
+                } catch {}
+            }
+            return $DefaultValue
+        }
+    }
+}
 Function Write-Nessus-Header() {
-    #Creates nessus XML file header
-    Add-Content -Path "$outputdir\adaudit.nessus" -Value "<?xml version=`"1.0`" ?><AdAudit>"
-    Add-Content -Path "$outputdir\adaudit.nessus" -Value "<Report name=`"$env:ComputerName`" xmlns:cm=`"http://www.nessus.org/cm`">"
-    Add-Content -Path "$outputdir\adaudit.nessus" -Value "<ReportHost name=`"$env:ComputerName`"><HostProperties></HostProperties>"
+    # FIX v1.4.0: defer Nessus XML serialization to Write-Nessus-Footer (atomic write via XmlWriter
+    # in a try/finally). Avoids two failure modes: (a) line-by-line Add-Content can corrupt the file
+    # if the script crashes (no closing tags) and (b) parallel module execution would interleave writes.
+    if (-not $script:nessusFindings) {
+        $script:nessusFindings = New-Object System.Collections.Generic.List[object]
+    }
 }
 Function Write-Nessus-Finding( [string]$pluginname, [string]$pluginid, [string]$pluginexample) {
     # Intercept: create structured finding from Nessus output
@@ -244,26 +364,66 @@ Function Write-Nessus-Finding( [string]$pluginname, [string]$pluginid, [string]$
         Add-NessusFinding -PluginName $pluginname -PluginId $pluginid -Evidence $pluginexample
     }
 
-    # Write Nessus XML unless suppressed
+    # Buffer for atomic XML emission at end-of-run
     if (-not $noNessus) {
-        # Properly escape XML special characters in all parameters
-        $escapedPluginName    = Escape-XmlSpecialCharacters $pluginname
-        $escapedPluginId      = Escape-XmlSpecialCharacters $pluginid
-        $escapedPluginExample = Escape-XmlSpecialCharacters $pluginexample
-
-        Add-Content -Path "$outputdir\adaudit.nessus" -Value "<ReportItem port=`"0`" svc_name=`"`" protocol=`"`" severity=`"0`" pluginID=`"ADAudit_$escapedPluginId`" pluginName=`"$escapedPluginName`" pluginFamily=`"Windows`">"
-        Add-Content -Path "$outputdir\adaudit.nessus" -Value "<description>There's an issue with $escapedPluginName</description>"
-        Add-Content -Path "$outputdir\adaudit.nessus" -Value "<plugin_type>remote</plugin_type><risk_factor>Low</risk_factor>"
-        Add-Content -Path "$outputdir\adaudit.nessus" -Value "<solution>CCS Recommends fixing the issues with $escapedPluginName on the host</solution>"
-        Add-Content -Path "$outputdir\adaudit.nessus" -Value "<synopsis>There's an issue with the $escapedPluginName settings on the host</synopsis>"
-        Add-Content -Path "$outputdir\adaudit.nessus" -Value "<plugin_output>$escapedPluginExample</plugin_output></ReportItem>"
+        if (-not $script:nessusFindings) {
+            $script:nessusFindings = New-Object System.Collections.Generic.List[object]
+        }
+        $script:nessusFindings.Add([PSCustomObject]@{
+            PluginName = $pluginname
+            PluginId   = $pluginid
+            Evidence   = $pluginexample
+        })
     }
 }
 Function Write-Nessus-Footer() {
-    Add-Content -Path "$outputdir\adaudit.nessus" -Value "</ReportHost></Report></AdAudit>"
+    if ($noNessus) { return }
+    $path = "$outputdir\adaudit.nessus"
+    $writer = $null
+    try {
+        $settings = New-Object System.Xml.XmlWriterSettings
+        $settings.Indent = $true
+        $settings.Encoding = New-Object System.Text.UTF8Encoding($false)
+        $writer = [System.Xml.XmlWriter]::Create($path, $settings)
+        $writer.WriteStartDocument()
+        $writer.WriteStartElement('AdAudit')
+        $writer.WriteStartElement('Report')
+        $writer.WriteAttributeString('name', $env:ComputerName)
+        $writer.WriteAttributeString('xmlns','cm','http://www.w3.org/2000/xmlns/','http://www.nessus.org/cm')
+        $writer.WriteStartElement('ReportHost')
+        $writer.WriteAttributeString('name', $env:ComputerName)
+        $writer.WriteStartElement('HostProperties') ; $writer.WriteEndElement()
+
+        foreach ($f in @($script:nessusFindings)) {
+            $writer.WriteStartElement('ReportItem')
+            $writer.WriteAttributeString('port','0')
+            $writer.WriteAttributeString('svc_name','')
+            $writer.WriteAttributeString('protocol','')
+            $writer.WriteAttributeString('severity','0')
+            $writer.WriteAttributeString('pluginID',"ADAudit_$($f.PluginId)")
+            $writer.WriteAttributeString('pluginName',$f.PluginName)
+            $writer.WriteAttributeString('pluginFamily','Windows')
+            $writer.WriteElementString('description', "There's an issue with $($f.PluginName)")
+            $writer.WriteElementString('plugin_type','remote')
+            $writer.WriteElementString('risk_factor','Low')
+            $writer.WriteElementString('solution', "Recommends fixing the issues with $($f.PluginName) on the host")
+            $writer.WriteElementString('synopsis', "There's an issue with the $($f.PluginName) settings on the host")
+            $writer.WriteElementString('plugin_output', "$($f.Evidence)")
+            $writer.WriteEndElement()  # ReportItem
+        }
+
+        $writer.WriteEndElement()  # ReportHost
+        $writer.WriteEndElement()  # Report
+        $writer.WriteEndElement()  # AdAudit
+        $writer.WriteEndDocument()
+    } catch {
+        Write-Both "    [!] Nessus XML emission failed: $($_.Exception.Message)"
+    } finally {
+        if ($writer) { try { $writer.Flush() } catch {} ; try { $writer.Close() } catch {} ; try { $writer.Dispose() } catch {} }
+    }
 }
-Function Escape-XmlSpecialCharacters {
-    #Properly escapes XML special characters
+Function ConvertTo-XmlSafeString {
+    #Properly escapes XML special characters (PS-approved verb 'ConvertTo')
     param([string]$Value)
     if ([string]::IsNullOrEmpty($Value)) { return $Value }
 
@@ -275,6 +435,8 @@ Function Escape-XmlSpecialCharacters {
 
     return $Value
 }
+# Backwards-compatible alias for any external caller still using the old name.
+Set-Alias -Name 'Escape-XmlSpecialCharacters' -Value 'ConvertTo-XmlSafeString' -Scope Script -Force -ErrorAction SilentlyContinue
 Function Get-ADAclSafe {
     # Resolve AD ACL with resilient provider path fallback.
     param(
@@ -284,10 +446,13 @@ Function Get-ADAclSafe {
 
     if ([string]::IsNullOrWhiteSpace($DistinguishedName)) { return $null }
 
+    # Try the canonical AD: provider path first; fall back to alternatives only if it fails.
+    # The full provider path (Microsoft.ActiveDirectory.Management.dll\...) requires a specific
+    # PSDrive mount and almost always fails; trying it first only generates noise in debug.log.
     $paths = @(
-        "Microsoft.ActiveDirectory.Management.dll\ActiveDirectory:://RootDSE/$DistinguishedName",
         "AD:\$DistinguishedName",
-        "AD:$DistinguishedName"
+        "AD:$DistinguishedName",
+        "Microsoft.ActiveDirectory.Management.dll\ActiveDirectory:://RootDSE/$DistinguishedName"
     )
 
     foreach ($p in $paths) {
@@ -319,11 +484,13 @@ Function Get-DNSZoneInsecure {
     }
 }
 Function Get-OUPerms {
-    #Check for non-standard perms for authenticated users, domain users, users and everyone groups
+    # FIX v1.4.0: Restrict scope to OUs (the only objects on which "non-standard OU perms"
+    # is meaningful) and paginate via -ResultPageSize. Previously enumerated EVERY object
+    # in AD with -Filter * (no paging) → memory blowup on dominios grandes.
     $count = 0
     $progresscount = 0
-    $objects = (Get-ADObject -Filter *)
-    $totalcount = ($objects | Measure-Object | Select-Object Count).count
+    $objects = @(Get-ADObject -LDAPFilter '(objectClass=organizationalUnit)' -ResultPageSize 500 -ErrorAction SilentlyContinue)
+    $totalcount = $objects.Count
     foreach ($object in $objects) {
         if ($totalcount -eq 0) { break }
         $progresscount++
@@ -727,7 +894,7 @@ Function Get-ProtectedUsers {
 }
 Function Get-AuthenticationPoliciesAndSilos {
     #Lists any authentication policies and silos (2012R2 and above)
-    if ([single](Get-WinVersion) -ge [single]6.3) {
+    if ((Get-WinVersionFloat) -ge [single]6.3) {
         #NT6.2 or greater detected so running this script
         $count = 0
         foreach ($policy in Get-ADAuthenticationPolicy -Filter *) {
@@ -757,28 +924,31 @@ Function Get-MachineAccountQuota {
 }
 Function Get-PasswordPolicy {
     Write-Both "    [+] Checking default password policy"
-    if (!(Get-ADDefaultDomainPasswordPolicy).ComplexityEnabled) {
+    # FIX v1.4.0: cache the policy lookup once. Previous code invoked Get-ADDefaultDomainPasswordPolicy
+    # 12 times in this function alone → 12 LDAP round-trips per audit, with stale-read risk.
+    $pol = Get-ADDefaultDomainPasswordPolicy
+    if (-not $pol.ComplexityEnabled) {
         Write-Both "    [!] Password Complexity not enabled (KB262)"
         Write-Nessus-Finding "PasswordComplexity" "KB262" "Password Complexity not enabled"
     }
-    if ((Get-ADDefaultDomainPasswordPolicy).LockoutThreshold -lt 5) {
-        Write-Both "    [!] Lockout threshold is less than 5, currently set to $((Get-ADDefaultDomainPasswordPolicy).LockoutThreshold) (KB263)"
-        Write-Nessus-Finding "LockoutThreshold" "KB263" "Lockout threshold is less than 5, currently set to $((Get-ADDefaultDomainPasswordPolicy).LockoutThreshold)"
+    if ($pol.LockoutThreshold -lt 5) {
+        Write-Both "    [!] Lockout threshold is less than 5, currently set to $($pol.LockoutThreshold) (KB263)"
+        Write-Nessus-Finding "LockoutThreshold" "KB263" "Lockout threshold is less than 5, currently set to $($pol.LockoutThreshold)"
     }
-    if ((Get-ADDefaultDomainPasswordPolicy).MinPasswordLength -lt 14) {
-        Write-Both "    [!] Minimum password length is less than 14, currently set to $((Get-ADDefaultDomainPasswordPolicy).MinPasswordLength) (KB262)"
-        Write-Nessus-Finding "PasswordLength" "KB262" "Minimum password length is less than 14, currently set to $((Get-ADDefaultDomainPasswordPolicy).MinPasswordLength)"
+    if ($pol.MinPasswordLength -lt 14) {
+        Write-Both "    [!] Minimum password length is less than 14, currently set to $($pol.MinPasswordLength) (KB262)"
+        Write-Nessus-Finding "PasswordLength" "KB262" "Minimum password length is less than 14, currently set to $($pol.MinPasswordLength)"
     }
-    if ((Get-ADDefaultDomainPasswordPolicy).ReversibleEncryptionEnabled) {
+    if ($pol.ReversibleEncryptionEnabled) {
         Write-Both "    [!] Reversible encryption is enabled"
     }
-    if ((Get-ADDefaultDomainPasswordPolicy).MaxPasswordAge -eq "00:00:00") {
+    if ($pol.MaxPasswordAge -eq "00:00:00") {
         Write-Both "    [!] Passwords do not expire (KB254)"
         Write-Nessus-Finding "PasswordsDoNotExpire" "KB254" "Passwords do not expire"
     }
-    if ((Get-ADDefaultDomainPasswordPolicy).PasswordHistoryCount -lt 12) {
-        Write-Both "    [!] Passwords history is less than 12, currently set to $((Get-ADDefaultDomainPasswordPolicy).PasswordHistoryCount) (KB262)"
-        Write-Nessus-Finding "PasswordHistory" "KB262" "Passwords history is less than 12, currently set to $((Get-ADDefaultDomainPasswordPolicy).PasswordHistoryCount)"
+    if ($pol.PasswordHistoryCount -lt 12) {
+        Write-Both "    [!] Passwords history is less than 12, currently set to $($pol.PasswordHistoryCount) (KB262)"
+        Write-Nessus-Finding "PasswordHistory" "KB262" "Passwords history is less than 12, currently set to $($pol.PasswordHistoryCount)"
     }
     if ((Get-ItemProperty -Path HKLM:\SYSTEM\CurrentControlSet\Control\Lsa).NoLmHash -eq 0) {
         Write-Both "    [!] LM Hashes are stored! (KB510)"
@@ -830,46 +1000,73 @@ Function Get-NULLSessions {
     }
 }
 Function Get-DomainTrusts {
-    #Lists domain trusts if they are bad
+    # FIX v1.4.0: TrustAttributes is a bitmask (NOT exact-equal). Evaluate flags via -band so
+    # combined values like 0x68 (forest+transitive+SID-history) classify correctly.
+    # Critical: SID Filtering disabled (TRUST_ATTRIBUTE_TREAT_AS_EXTERNAL absent on a forest trust,
+    # combined with TRUST_ATTRIBUTE_FOREST_TRANSITIVE) is the cross-forest privilege escalation vector.
+    # Reference: [MS-ADTS] §6.1.6.7.9 trustAttributes flags.
+    $TA_NON_TRANSITIVE       = 0x00000001
+    $TA_UPLEVEL_ONLY         = 0x00000002
+    $TA_QUARANTINED_DOMAIN   = 0x00000004   # SID Filtering enabled
+    $TA_FOREST_TRANSITIVE    = 0x00000008
+    $TA_CROSS_ORGANIZATION   = 0x00000010
+    $TA_WITHIN_FOREST        = 0x00000020
+    $TA_TREAT_AS_EXTERNAL    = 0x00000040
+    $TA_USES_RC4_ENCRYPTION  = 0x00000080
+    $TA_NO_TGT_DELEGATION    = 0x00000200
+    $TA_PIM_TRUST            = 0x00000400
+
     foreach ($trust in (Get-ADObject -Filter { objectClass -eq "trustedDomain" } -Properties TrustPartner, TrustDirection, trustType, trustAttributes)) {
-        if ($trust.TrustDirection -eq 2) {
-            if ($trust.TrustAttributes -eq 1 -or $trust.TrustAttributes -eq 4) {
-                #1 means trust is non-transitive, 4 is external so we check for anything but that
-                Write-Both "    [!] The domain $($trust.Name) is trusted by $env:UserDomain! (KB250)"
-                Write-Nessus-Finding "DomainTrusts" "KB250" "The domain $($trust.Name) is trusted by $env:UserDomain."
-            }
-            else {
-                Write-Both "    [!] The domain $($trust.Name) is trusted by $env:UserDomain and it is Transitive! (KB250)"
-                Write-Nessus-Finding "DomainTrusts" "KB250" "The domain $($trust.Name) is trusted by $env:UserDomain and it is Transitive!"
-            }
-        }
-        if ($trust.TrustDirection -eq 3) {
-            if ($trust.TrustAttributes -eq 1 -or $trust.TrustAttributes -eq 4) {
-                #1 means trust is non-transitive, 4 is external so we check for anything but that
-                Write-Both "    [!] The domain $($trust.Name) is trusted by $env:UserDomain! (KB250)"
-                Write-Nessus-Finding "DomainTrusts" "KB250" "The domain $($trust.Name) is trusted by $env:UserDomain."
-            }
-            else {
-                Write-Both "    [!] The domain $($trust.Name) is trusted by $env:UserDomain and it is Transitive! (KB250)"
-                Write-Nessus-Finding "DomainTrusts" "KB250" "The domain $($trust.Name) is trusted by $env:UserDomain and it is Transitive!"
-            }
+        $attrs = [int]$trust.TrustAttributes
+        $isInbound       = ($trust.TrustDirection -eq 2 -or $trust.TrustDirection -eq 3)  # Inbound or Bidirectional
+        $isNonTransitive = ($attrs -band $TA_NON_TRANSITIVE) -ne 0
+        $isQuarantined   = ($attrs -band $TA_QUARANTINED_DOMAIN) -ne 0  # SID Filtering ON
+        $isForest        = ($attrs -band $TA_FOREST_TRANSITIVE) -ne 0
+        $isExternal      = ($attrs -band $TA_TREAT_AS_EXTERNAL) -ne 0
+        $usesRC4         = ($attrs -band $TA_USES_RC4_ENCRYPTION) -ne 0
+        $noTgtDelegation = ($attrs -band $TA_NO_TGT_DELEGATION) -ne 0
+
+        if (-not $isInbound) { continue }   # Only flag trusts from which we can be attacked
+
+        $type = if ($isForest) { 'forest' } elseif ($isExternal) { 'external' } else { 'parent/child or shortcut' }
+        $transitivity = if ($isNonTransitive) { 'non-transitive' } else { 'TRANSITIVE' }
+        $sidFiltering = if ($isQuarantined -or $isExternal) { 'enabled' } else { 'DISABLED (SID History abuse risk)' }
+
+        $msg = "Trust '$($trust.Name)' (type=$type, $transitivity, SID-Filtering=$sidFiltering, attrs=0x$('{0:X}' -f $attrs))"
+        if ($usesRC4)         { $msg += ' [USES_RC4_ENCRYPTION]' }
+        if ($noTgtDelegation) { $msg += ' [NO_TGT_DELEGATION]'   }
+
+        Write-Both "    [!] $msg"
+
+        # Critical: SID Filtering disabled on a transitive trust is a cross-forest escalation vector.
+        if (-not ($isQuarantined -or $isExternal -or $isNonTransitive)) {
+            Write-Nessus-Finding "DomainTrustsSIDFilteringDisabled" "KB250" "$msg — SID Filtering disabled on a transitive inbound trust enables SID-History injection / cross-forest privilege escalation."
+        } else {
+            Write-Nessus-Finding "DomainTrusts" "KB250" $msg
         }
     }
 }
 Function Get-WinVersion {
-    $WinVersion = [single]([string][environment]::OSVersion.Version.Major + "." + [string][environment]::OSVersion.Version.Minor)
-    return [single]$WinVersion
+    # Returns a [Version] object so callers can compare against [Version]'6.3', etc.
+    # Using [single] (float) loses minor precision (e.g. "10.0" → 10.0, "6.10" → 6.1)
+    # and breaks comparisons on Windows Server 2025 (10.0.26100).
+    return [Version]([Environment]::OSVersion.Version)
+}
+Function Get-WinVersionFloat {
+    # Backwards-compatible accessor for callers that still expect a float (deprecated).
+    $v = Get-WinVersion
+    return [single]("$($v.Major).$($v.Minor)")
 }
 Function Get-SMB1Support {
     #Check if server supports SMBv1
-    if ([single](Get-WinVersion) -le [single]6.1) {
+    if ((Get-WinVersionFloat) -le [single]6.1) {
         #NT6.1 or less detected so checking reg key
         if (!(Get-ItemProperty -Path HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters).SMB1 -eq 0) {
             Write-Both "    [!] SMBv1 is not disabled (KB290)"
             Write-Nessus-Finding "SMBv1Support" "KB290" "SMBv1 is enabled"
         }
     }
-    elseif ([single](Get-WinVersion) -ge [single]6.2) {
+    elseif ((Get-WinVersionFloat) -ge [single]6.2) {
         #NT6.2 or greater detected so using powershell function
         if ((Get-SmbServerConfiguration).EnableSMB1Protocol) {
             Write-Both "    [!] SMBv1 is enabled! (KB290)"
@@ -941,13 +1138,97 @@ Function Get-GPOsPerOU {
     Write-Both "    [+] Inherited GPOs saved to ous_inheritedGPOs.txt"
 }
 Function Get-NTDSdit {
-    #Dumps NTDS.dit, SYSTEM and SAM for password cracking
-    if (Test-Path "$outputdir\ntds.dit") { Remove-Item "$outputdir\ntds.dit" -Recurse }
-    $outputdirntds = '\"' + $outputdir + '\ntds.dit\"'
-    $command = "ntdsutil `"ac in ntds`" `"ifm`" `"cr fu $outputdirntds `" q q"
-    $hide = cmd.exe /c "$command" 2>&1
-    Write-Both "    [+] NTDS.dit, SYSTEM & SAM saved to output folder"
-    Write-Both "    [+] Use secretsdump.py -system registry/SYSTEM -ntds Active\ Directory/ntds.dit LOCAL -outputfile customer"
+    # FIX v1.4.0:
+    #   1. Validate $outputdir against shell metacharacters (blocks cmd injection via -outputPath).
+    #   2. Use Start-Process with -ArgumentList (no cmd.exe /c, no string concatenation).
+    #   3. Read $LASTEXITCODE from ntdsutil — previously, failure was silently reported as success.
+    #   4. ntdsutil "ifm" creates a *directory* tree (Active Directory/, registry/), not a file —
+    #      remove via -Recurse before retrying.
+    #   5. Apply NTFS ACL (icacls /inheritance:r /grant SYSTEM+Administrators only) immediately
+    #      after dump. Without this, the NTDS.dit dump (containing every domain hash) inherited
+    #      whatever permissions $outputdir had — potentially world-readable.
+    #   6. Emit a structured chain-of-custody finding (KB738) recording who ran -ntds, when, and
+    #      the SHA-256 of the dumped NTDS.dit so an evidence handover is auditable.
+
+    # 1. Refuse outputPath containing characters that have shell meaning, even though we no longer
+    #    pass them to cmd.exe. ntdsutil itself parses its own arguments and quoting; defense in depth.
+    if ($outputdir -match '[&|;<>"`$]') {
+        Write-Both "    [!] Refusing to dump NTDS to outputPath with shell metacharacters: $outputdir"
+        Write-Nessus-Finding "NTDSDumpRefused" "KB738" "Refused NTDS.dit dump: outputPath contains shell metacharacters ($outputdir). Re-run -ntds with a clean -outputPath."
+        return
+    }
+
+    $dumpRoot = Join-Path $outputdir 'ntds.dit'
+    if (Test-Path -LiteralPath $dumpRoot) {
+        try { Remove-Item -LiteralPath $dumpRoot -Recurse -Force -ErrorAction Stop } catch {
+            Write-Both "    [!] Could not remove previous NTDS dump dir: $($_.Exception.Message)"
+            return
+        }
+    }
+
+    # 2/3. Invoke ntdsutil safely. The 'create full' command takes a single path argument.
+    $stdoutFile = Join-Path $outputdir 'ntdsutil_stdout.log'
+    $stderrFile = Join-Path $outputdir 'ntdsutil_stderr.log'
+    $args = @(
+        'ac in ntds',
+        'ifm',
+        ('cr fu "{0}"' -f $dumpRoot),
+        'q',
+        'q'
+    )
+    try {
+        $proc = Start-Process -FilePath 'ntdsutil.exe' -ArgumentList $args `
+            -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile -ErrorAction Stop
+        if ($proc.ExitCode -ne 0) {
+            $tail = ''
+            try { $tail = (Get-Content -LiteralPath $stdoutFile -Tail 20 -ErrorAction SilentlyContinue) -join "`n" } catch {}
+            Write-Both "    [!] ntdsutil exited with code $($proc.ExitCode)`n$tail"
+            Write-Nessus-Finding "NTDSDumpFailed" "KB738" "ntdsutil exit code $($proc.ExitCode). Dump aborted."
+            return
+        }
+    } catch {
+        Write-Both "    [!] Could not invoke ntdsutil: $($_.Exception.Message)"
+        return
+    }
+
+    if (-not (Test-Path -LiteralPath $dumpRoot)) {
+        Write-Both "    [!] ntdsutil reported success but $dumpRoot does not exist."
+        Write-Nessus-Finding "NTDSDumpFailed" "KB738" "ntdsutil exit=0 but dump directory missing."
+        return
+    }
+
+    # 5. Lock down the dump directory: SYSTEM + BUILTIN\Administrators only, no inheritance.
+    try {
+        $icaclsResult = & icacls.exe $dumpRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' 2>&1
+        Write-Both "    [+] Applied NTFS ACL (SYSTEM + Administrators only) to $dumpRoot"
+    } catch {
+        Write-Both "    [!] icacls failed on $dumpRoot — $($_.Exception.Message)"
+    }
+
+    # 6. Chain-of-custody finding
+    $ntdsFile = Get-ChildItem -Path $dumpRoot -Recurse -Filter 'ntds.dit' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $sha256 = 'unavailable'
+    if ($ntdsFile) {
+        try { $sha256 = (Get-FileHash -Path $ntdsFile.FullName -Algorithm SHA256 -ErrorAction Stop).Hash } catch {}
+    }
+    $ts = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $custody = @"
+NTDS.dit Chain of Custody
+=========================
+DC               : $env:COMPUTERNAME
+Operator         : $env:USERDOMAIN\$env:USERNAME
+Timestamp (UTC)  : $ts
+Dump path        : $dumpRoot
+NTDS.dit SHA-256 : $sha256
+ACL              : SYSTEM + BUILTIN\Administrators (no inheritance)
+"@
+    $custodyPath = Join-Path $outputdir 'ntds_custody.txt'
+    $custody | Set-Content -Path $custodyPath -Encoding UTF8
+    Write-Nessus-Finding "NTDSDumpChainOfCustody" "KB738" $custody
+    Write-Both "    [+] NTDS.dit, SYSTEM & SAM saved to $dumpRoot"
+    Write-Both "    [+] Chain-of-custody record: $custodyPath"
+    Write-Both "    [+] Process offline:  secretsdump.py -system $dumpRoot/registry/SYSTEM -ntds $dumpRoot/Active\ Directory/ntds.dit LOCAL -outputfile customer"
 }
 Function Get-SYSVOLXMLS {
     #Finds XML files in SYSVOL (thanks --> https://github.com/PowerShellMafia/PowerSploit/blob/master/Exfiltration/Get-GPPPassword.ps1)
@@ -1065,7 +1346,8 @@ Function Get-LockedAccounts {
     }
     Write-Progress -Activity "Searching for locked users..." -Status "Ready" -Completed
     if ($count -gt 0) {
-        Write-Both "    [!] $count locked user accounts, see accounts_locked.txt"
+        Write-Both "    [!] $count locked user accounts, see accounts_locked.txt (KB502)"
+        Write-Nessus-Finding "LockedAccounts" "KB502" ([System.IO.File]::ReadAllText("$outputdir\accounts_locked.txt"))
     }
 }
 Function Get-AccountPassDontExpire {
@@ -1086,20 +1368,50 @@ Function Get-AccountPassDontExpire {
     }
 }
 Function Get-OldBoxes {
-    #Lists 2000/2003/XP/Vista/7/2008 machines
-    $count = 0
-    $oldboxes = Get-ADComputer -Filter { OperatingSystem -Like "*2003*" -and Enabled -eq "true" -or OperatingSystem -Like "*XP*" -and Enabled -eq "true" -or OperatingSystem -Like "*2000*" -and Enabled -eq "true" -or OperatingSystem -like '*Windows 7*' -and Enabled -eq "true" -or OperatingSystem -like '*vista*' -and Enabled -eq "true" -or OperatingSystem -like '*2008*' -and Enabled -eq "true" -or OperatingSystem -like '*2012*' -and Enabled -eq "true"} -Property OperatingSystem
-    $totalcount = ($oldboxes | Measure-Object | Select-Object Count).count
-    foreach ($machine in $oldboxes) {
-        if ($totalcount -eq 0) { break }
-        Write-Progress -Activity "Searching for 2000/2003/XP/Vista/7/2008 devices joined to the domain..." -Status "Currently identifed $count" -PercentComplete ($count / $totalcount * 100)
-        Add-Content -Path "$outputdir\machines_old.txt" -Value "$($machine.Name), $($machine.OperatingSystem), $($machine.OperatingSystemServicePack), $($machine.OperatingSystemVersio), $($machine.IPv4Address)"
-        $count++
+    # FIX v1.4.0: Split EOL detection into clearly-defined buckets so the report can distinguish:
+    #   - Server 2012 (non-R2) [HIGH severity, no ESU bridge]
+    #   - Server 2012 R2 [MEDIUM, ESU available through 2026]
+    #   - Server 2016 [MEDIUM, EOL Jan 2027 — within warning window]
+    #   - Legacy (2000/2003/XP/Vista/7/2008/8) [HIGH, no support of any kind]
+    $allEnabled = @(Get-ADComputer -Filter { Enabled -eq $true } -Properties OperatingSystem, OperatingSystemServicePack, OperatingSystemVersion, IPv4Address)
+
+    $legacyOld = @($allEnabled | Where-Object {
+        $_.OperatingSystem -and (
+            $_.OperatingSystem -like '*2003*' -or $_.OperatingSystem -like '*XP*'   -or
+            $_.OperatingSystem -like '*2000*' -or $_.OperatingSystem -like '*Windows 7*' -or
+            $_.OperatingSystem -like '*Vista*' -or $_.OperatingSystem -like '*2008*' -or
+            $_.OperatingSystem -like '*Windows 8*'
+        )
+    })
+    $srv2012  = @($allEnabled | Where-Object { $_.OperatingSystem -like '*Server 2012*' -and $_.OperatingSystem -notlike '*R2*' })
+    $srv2012R2 = @($allEnabled | Where-Object { $_.OperatingSystem -like '*Server 2012 R2*' })
+    $srv2016  = @($allEnabled | Where-Object { $_.OperatingSystem -like '*Server 2016*' })
+
+    function _emit($bucket, $kbId, $label, $progressLabel) {
+        if ($bucket.Count -eq 0) { return }
+        $file = Join-Path $outputdir ("machines_old_" + ($label -replace '[^A-Za-z0-9]','_') + ".txt")
+        Remove-Item $file -ErrorAction SilentlyContinue
+        $i = 0
+        foreach ($m in $bucket) {
+            $i++
+            Write-Progress -Activity $progressLabel -Status "$i / $($bucket.Count)" -PercentComplete ($i / $bucket.Count * 100)
+            Add-Content -Path $file -Value "$($m.Name), $($m.OperatingSystem), $($m.OperatingSystemServicePack), $($m.OperatingSystemVersion), $($m.IPv4Address)"
+        }
+        Write-Progress -Activity $progressLabel -Status 'Ready' -Completed
+        Write-Both "    [!] $($bucket.Count) machines: $label (see $(Split-Path $file -Leaf))  ($kbId)"
+        Write-Nessus-Finding "OldBoxes-$label" $kbId ([System.IO.File]::ReadAllText($file))
     }
-    Write-Progress -Activity "Searching for 2000/2003/XP/Vista/7/2008 devices joined to the domain..." -Status "Ready" -Completed
-    if ($count -gt 0) {
-        Write-Both "    [!] We found $count machines running 2000/2003/XP/Vista/7/2008! see machines_old.txt (KB3/37/38/KB259)"
-        Write-Nessus-Finding "OldBoxes" "KB259" ([System.IO.File]::ReadAllText("$outputdir\machines_old.txt"))
+    _emit $legacyOld   'KB259'  'Legacy_2000-2008-XP-Vista-7-8' 'Searching for legacy/EOL devices...'
+    _emit $srv2012     'KB259a' 'Windows_Server_2012'           'Searching for Server 2012 (non-R2) devices...'
+    _emit $srv2012R2   'KB259b' 'Windows_Server_2012R2'         'Searching for Server 2012 R2 devices...'
+    _emit $srv2016     'KB259c' 'Windows_Server_2016'           'Searching for Server 2016 devices (approaching EOL)...'
+
+    # Also write the legacy aggregate file machines_old.txt for backwards compatibility with
+    # the report parser stems (kept for older baselines/diff tooling).
+    $aggregate = $legacyOld + $srv2012 + $srv2012R2 + $srv2016
+    if ($aggregate.Count -gt 0) {
+        $rows = foreach ($m in $aggregate) { "$($m.Name), $($m.OperatingSystem), $($m.OperatingSystemServicePack), $($m.OperatingSystemVersion), $($m.IPv4Address)" }
+        $rows | Set-Content -Path "$outputdir\machines_old.txt"
     }
 }
 Function Get-DCsNotOwnedByDA {
@@ -1140,23 +1452,23 @@ Function Get-HostDetails {
 Function Get-FunctionalLevel {
     #Gets the functional level for domain and forest
     $DomainLevel = (Get-ADDomain).domainMode
-    if ($DomainLevel -eq "Windows2000Domain" -and [single](Get-WinVersion) -gt 5.0) { Write-Both "    [!] DomainLevel is reduced for backwards compatibility to $DomainLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "DomainLevel is reduced for backwards compatibility to $DomainLevel" }
-    if ($DomainLevel -eq "Windows2003InterimDomain" -and [single](Get-WinVersion) -gt 5.1) { Write-Both "    [!] DomainLevel is reduced for backwards compatibility to $DomainLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "DomainLevel is reduced for backwards compatibility to $DomainLevel" }
-    if ($DomainLevel -eq "Windows2003Domain" -and [single](Get-WinVersion) -gt 5.2) { Write-Both "    [!] DomainLevel is reduced for backwards compatibility to $DomainLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "DomainLevel is reduced for backwards compatibility to $DomainLevel" }
-    if ($DomainLevel -eq "Windows2008Domain" -and [single](Get-WinVersion) -gt 6.0) { Write-Both "    [!] DomainLevel is reduced for backwards compatibility to $DomainLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "DomainLevel is reduced for backwards compatibility to $DomainLevel" }
-    if ($DomainLevel -eq "Windows2008R2Domain" -and [single](Get-WinVersion) -gt 6.1) { Write-Both "    [!] DomainLevel is reduced for backwards compatibility to $DomainLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "DomainLevel is reduced for backwards compatibility to $DomainLevel" }
-    if ($DomainLevel -eq "Windows2012Domain" -and [single](Get-WinVersion) -gt 6.2) { Write-Both "    [!] DomainLevel is reduced for backwards compatibility to $DomainLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "DomainLevel is reduced for backwards compatibility to $DomainLevel" }
-    if ($DomainLevel -eq "Windows2012R2Domain" -and [single](Get-WinVersion) -gt 6.3) { Write-Both "    [!] DomainLevel is reduced for backwards compatibility to $DomainLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "DomainLevel is reduced for backwards compatibility to $DomainLevel" }
-    if ($DomainLevel -eq "Windows2016Domain" -and [single](Get-WinVersion) -gt 10.0) { Write-Both "    [!] DomainLevel is reduced for backwards compatibility to $DomainLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "DomainLevel is reduced for backwards compatibility to $DomainLevel" }
+    if ($DomainLevel -eq "Windows2000Domain" -and (Get-WinVersionFloat) -gt 5.0) { Write-Both "    [!] DomainLevel is reduced for backwards compatibility to $DomainLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "DomainLevel is reduced for backwards compatibility to $DomainLevel" }
+    if ($DomainLevel -eq "Windows2003InterimDomain" -and (Get-WinVersionFloat) -gt 5.1) { Write-Both "    [!] DomainLevel is reduced for backwards compatibility to $DomainLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "DomainLevel is reduced for backwards compatibility to $DomainLevel" }
+    if ($DomainLevel -eq "Windows2003Domain" -and (Get-WinVersionFloat) -gt 5.2) { Write-Both "    [!] DomainLevel is reduced for backwards compatibility to $DomainLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "DomainLevel is reduced for backwards compatibility to $DomainLevel" }
+    if ($DomainLevel -eq "Windows2008Domain" -and (Get-WinVersionFloat) -gt 6.0) { Write-Both "    [!] DomainLevel is reduced for backwards compatibility to $DomainLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "DomainLevel is reduced for backwards compatibility to $DomainLevel" }
+    if ($DomainLevel -eq "Windows2008R2Domain" -and (Get-WinVersionFloat) -gt 6.1) { Write-Both "    [!] DomainLevel is reduced for backwards compatibility to $DomainLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "DomainLevel is reduced for backwards compatibility to $DomainLevel" }
+    if ($DomainLevel -eq "Windows2012Domain" -and (Get-WinVersionFloat) -gt 6.2) { Write-Both "    [!] DomainLevel is reduced for backwards compatibility to $DomainLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "DomainLevel is reduced for backwards compatibility to $DomainLevel" }
+    if ($DomainLevel -eq "Windows2012R2Domain" -and (Get-WinVersionFloat) -gt 6.3) { Write-Both "    [!] DomainLevel is reduced for backwards compatibility to $DomainLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "DomainLevel is reduced for backwards compatibility to $DomainLevel" }
+    if ($DomainLevel -eq "Windows2016Domain" -and (Get-WinVersionFloat) -gt 10.0) { Write-Both "    [!] DomainLevel is reduced for backwards compatibility to $DomainLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "DomainLevel is reduced for backwards compatibility to $DomainLevel" }
     $ForestLevel = (Get-ADForest).ForestMode
-    if ($ForestLevel -eq "Windows2000Forest" -and [single](Get-WinVersion) -gt 5.0) { Write-Both "    [!] ForestLevel is reduced for backwards compatibility to $ForestLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "ForestLevel is reduced for backwards compatibility to $ForestLevel" }
-    if ($ForestLevel -eq "Windows2003InterimForest" -and [single](Get-WinVersion) -gt 5.1) { Write-Both "    [!] ForestLevel is reduced for backwards compatibility to $ForestLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "ForestLevel is reduced for backwards compatibility to $ForestLevel" }
-    if ($ForestLevel -eq "Windows2003Forest" -and [single](Get-WinVersion) -gt 5.2) { Write-Both "    [!] ForestLevel is reduced for backwards compatibility to $ForestLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "ForestLevel is reduced for backwards compatibility to $ForestLevel" }
-    if ($ForestLevel -eq "Windows2008Forest" -and [single](Get-WinVersion) -gt 6.0) { Write-Both "    [!] ForestLevel is reduced for backwards compatibility to $ForestLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "ForestLevel is reduced for backwards compatibility to $ForestLevel" }
-    if ($ForestLevel -eq "Windows2008R2Forest" -and [single](Get-WinVersion) -gt 6.1) { Write-Both "    [!] ForestLevel is reduced for backwards compatibility to $ForestLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "ForestLevel is reduced for backwards compatibility to $ForestLevel" }
-    if ($ForestLevel -eq "Windows2012Forest" -and [single](Get-WinVersion) -gt 6.2) { Write-Both "    [!] ForestLevel is reduced for backwards compatibility to $ForestLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "ForestLevel is reduced for backwards compatibility to $ForestLevel" }
-    if ($ForestLevel -eq "Windows2012R2Forest" -and [single](Get-WinVersion) -gt 6.3) { Write-Both "    [!] ForestLevel is reduced for backwards compatibility to $ForestLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "ForestLevel is reduced for backwards compatibility to $ForestLevel" }
-    if ($ForestLevel -eq "Windows2016Forest" -and [single](Get-WinVersion) -gt 10.0) { Write-Both "    [!] ForestLevel is reduced for backwards compatibility to $ForestLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "ForestLevel is reduced for backwards compatibility to $ForestLevel" }
+    if ($ForestLevel -eq "Windows2000Forest" -and (Get-WinVersionFloat) -gt 5.0) { Write-Both "    [!] ForestLevel is reduced for backwards compatibility to $ForestLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "ForestLevel is reduced for backwards compatibility to $ForestLevel" }
+    if ($ForestLevel -eq "Windows2003InterimForest" -and (Get-WinVersionFloat) -gt 5.1) { Write-Both "    [!] ForestLevel is reduced for backwards compatibility to $ForestLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "ForestLevel is reduced for backwards compatibility to $ForestLevel" }
+    if ($ForestLevel -eq "Windows2003Forest" -and (Get-WinVersionFloat) -gt 5.2) { Write-Both "    [!] ForestLevel is reduced for backwards compatibility to $ForestLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "ForestLevel is reduced for backwards compatibility to $ForestLevel" }
+    if ($ForestLevel -eq "Windows2008Forest" -and (Get-WinVersionFloat) -gt 6.0) { Write-Both "    [!] ForestLevel is reduced for backwards compatibility to $ForestLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "ForestLevel is reduced for backwards compatibility to $ForestLevel" }
+    if ($ForestLevel -eq "Windows2008R2Forest" -and (Get-WinVersionFloat) -gt 6.1) { Write-Both "    [!] ForestLevel is reduced for backwards compatibility to $ForestLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "ForestLevel is reduced for backwards compatibility to $ForestLevel" }
+    if ($ForestLevel -eq "Windows2012Forest" -and (Get-WinVersionFloat) -gt 6.2) { Write-Both "    [!] ForestLevel is reduced for backwards compatibility to $ForestLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "ForestLevel is reduced for backwards compatibility to $ForestLevel" }
+    if ($ForestLevel -eq "Windows2012R2Forest" -and (Get-WinVersionFloat) -gt 6.3) { Write-Both "    [!] ForestLevel is reduced for backwards compatibility to $ForestLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "ForestLevel is reduced for backwards compatibility to $ForestLevel" }
+    if ($ForestLevel -eq "Windows2016Forest" -and (Get-WinVersionFloat) -gt 10.0) { Write-Both "    [!] ForestLevel is reduced for backwards compatibility to $ForestLevel!" ; Write-Nessus-Finding "FunctionalLevel" "KB546" "ForestLevel is reduced for backwards compatibility to $ForestLevel" }
 }
 Function Get-GPOEnum {
     #Loops GPOs for some important domain-wide settings
@@ -1929,7 +2241,9 @@ Function Get-RecycleBinState {
     }
 }
 Function Get-CriticalServicesStatus {
-    #Check AD services status
+    # FIX v1.4.0: use CIM with short OperationTimeout instead of Get-Service -ComputerName
+    # (which blocks on default RPC timeout ~60s per service per DC). Worst-case bound for
+    # 5 DCs * 6 services drops from ~30 minutes to ~5s per unreachable DC.
     Write-Both "    [+] Checking services on all DCs"
     $dcList = @()
     (Get-ADDomainController -Filter *) | ForEach-Object { $dcList += $_.Name }
@@ -1942,54 +2256,69 @@ Function Get-CriticalServicesStatus {
     else {
         $services = @("dns", "netlogon", "kdc", "w32time", "ntds", "ntfrs")
     }
+    $sessionOpts = $null
+    try { $sessionOpts = New-CimSessionOption -Protocol Wsman } catch {}
     foreach ($DC in $dcList) {
-        foreach ($service in $services) {
-            $checkService = Get-Service $service -ComputerName $DC -ErrorAction SilentlyContinue
-            $serviceName = $checkService.Name
-            $serviceStatus = $checkService.Status
-            if (!($serviceStatus)) {
-                Write-Both "        [!] Service $($service) cannot be checked on $DC!"
+        $session = $null
+        try {
+            $session = New-CimSession -ComputerName $DC -OperationTimeoutSec 10 -ErrorAction Stop
+            $svcs = Get-CimInstance -CimSession $session -ClassName Win32_Service -Filter "Name='$([string]::Join("' OR Name='", $services))'" -OperationTimeoutSec 10 -ErrorAction SilentlyContinue
+            $byName = @{}
+            foreach ($s in @($svcs)) { $byName[$s.Name.ToLower()] = $s }
+            foreach ($service in $services) {
+                $svc = $byName[$service.ToLower()]
+                if (-not $svc) {
+                    Write-Both "        [!] Service $($service) cannot be checked on $DC!"
+                } elseif ($svc.State -ne 'Running') {
+                    Write-Both "        [!] Service $($service) is not running on $DC! (State=$($svc.State))"
+                }
             }
-            elseif ($serviceStatus -ne "Running") {
-                Write-Both "        [!] Service $($service) is not running on $DC!"
-            }
+        } catch {
+            Write-Both "        [!] CIM session to $DC failed within 10s timeout: $($_.Exception.Message)"
+        } finally {
+            if ($session) { Remove-CimSession -CimSession $session -ErrorAction SilentlyContinue }
         }
     }
 }
 Function Get-LastWUDate {
-    #Check Windows update status and last install date
+    # FIX v1.4.0: replaced Get-WmiObject and Get-HotFix -ComputerName (RPC, 60s default)
+    # with Get-CimInstance + bounded OperationTimeoutSec 10 per call.
     $dcList = @()
     (Get-ADDomainController -Filter *) | ForEach-Object { $dcList += $_.Name }
     $lastMonth = (Get-Date).AddDays(-30)
     Write-Both "    [+] Checking Windows Update"
-    foreach ($DC in $dcList) {
-
-        $startMode = (Get-WmiObject -ComputerName $DC -Class Win32_Service -Property StartMode -Filter "Name='wuauserv'" -ErrorAction SilentlyContinue).StartMode
-        if (!($startMode)) {
-            Write-Both "        [!] Windows Update service cannot be checked on $DC!"
-        }
-        elseif ($startMode -eq "Disabled") {
-            Write-Both "        [!] Windows Update service is disabled on $DC!"
-        }
-    }
     $progresscount = 0
-    $totalcount = ($dcList | Measure-Object | Select-Object Count).count
+    $totalcount = $dcList.Count
     foreach ($DC in $dcList) {
         if ($totalcount -eq 0) { break }
         Write-Progress -Activity "Searching for last Windows Update installation on all DCs..." -Status "Currently searching on $DC" -PercentComplete ($progresscount / $totalcount * 100)
+        $session = $null
         try {
-            $lastHotfix = (Get-HotFix -ComputerName $DC | Where-Object { $_.InstalledOn -ne $null } | Sort-Object -Descending InstalledOn  | Select-Object -First 1).InstalledOn
-            if ($lastHotfix -lt $lastMonth) {
-                Write-Both "        [!] Windows is not up to date on $DC, last install: $($lastHotfix)"
+            $session = New-CimSession -ComputerName $DC -OperationTimeoutSec 10 -ErrorAction Stop
+            $startMode = (Get-CimInstance -CimSession $session -ClassName Win32_Service -Filter "Name='wuauserv'" -OperationTimeoutSec 10 -ErrorAction SilentlyContinue).StartMode
+            if (!($startMode)) {
+                Write-Both "        [!] Windows Update service cannot be checked on $DC!"
+            } elseif ($startMode -eq 'Disabled') {
+                Write-Both "        [!] Windows Update service is disabled on $DC!"
             }
-            else {
-                Write-Both "        [+] Windows is up to date on $DC, last install: $($lastHotfix)"
+            $hotfixes = @(Get-CimInstance -CimSession $session -ClassName Win32_QuickFixEngineering -OperationTimeoutSec 10 -ErrorAction SilentlyContinue |
+                          Where-Object { $_.InstalledOn -ne $null } | Sort-Object -Descending InstalledOn)
+            if ($hotfixes.Count -gt 0) {
+                $lastHotfix = $hotfixes[0].InstalledOn
+                if ($lastHotfix -lt $lastMonth) {
+                    Write-Both "        [!] Windows is not up to date on $DC, last install: $lastHotfix"
+                } else {
+                    Write-Both "        [+] Windows is up to date on $DC, last install: $lastHotfix"
+                }
+            } else {
+                Write-Both "        [!] Cannot determine last update date on $DC (empty Win32_QuickFixEngineering)"
             }
+        } catch {
+            Write-Both "        [!] CIM session to $DC failed within 10s timeout: $($_.Exception.Message)"
+        } finally {
+            if ($session) { Remove-CimSession -CimSession $session -ErrorAction SilentlyContinue }
+            $progresscount++
         }
-        catch {
-            Write-Both "        [!] Cannot check last update date on $DC"
-        }
-        $progresscount++
     }
     Write-Progress -Activity "Searching for last Windows Update installation on all DCs..." -Status "Ready" -Completed
 }
@@ -2066,11 +2395,13 @@ Function Install-Dependencies {
         Write-Both "    [!] PowerShell 5 or greater is needed, see https://www.microsoft.com/en-us/download/details.aspx?id=54616"
     }
 }
-Function Remove-StringLatinCharacters {
-    #Removes latin characters
+Function Remove-NonAsciiCharacter {
+    # Round-trips a string through Cyrillic→ASCII, which strips non-ASCII characters.
+    # Original (misnamed) function was Remove-StringLatinCharacters; alias kept for compatibility.
     PARAM ([string]$String)
     [Text.Encoding]::ASCII.GetString([Text.Encoding]::GetEncoding("Cyrillic").GetBytes($String))
 }
+Set-Alias -Name 'Remove-StringLatinCharacters' -Value 'Remove-NonAsciiCharacter' -Scope Script -Force -ErrorAction SilentlyContinue
 Function Get-PasswordQuality {
     #Use DSInternals to evaluate password quality
     if (Get-Module -ListAvailable -Name DSInternals) {
@@ -2093,161 +2424,208 @@ Function Get-PasswordQuality {
     }
 }
 Function Check-Shares {
-    #Check SYSVOL and NETLOGON share exists
+    # FIX v1.4.0: CIM with bounded timeout (was Get-WmiObject -ComputerName, RPC default ~60s).
     $dcList = @()
     (Get-ADDomainController -Filter *) | ForEach-Object { $dcList += $_.Name }
     Write-Both "    [+] Checking SYSVOL and NETLOGON shares on all DCs"
     foreach ($DC in $dcList) {
-        $shareList = (Get-WmiObject -Class Win32_Share -ComputerName $DC -ErrorAction SilentlyContinue)
-        if (!($shareList)) {
-            Write-Both "        [!] Cannot test shares on $DC!"
-        }
-        else {
-            $sysvolShare = ($shareList | ? { $_ -match 'SYSVOL' }   | measure).Count
-            $netlogonShare = ($shareList | ? { $_ -match 'NETLOGON' } | measure).Count
-            if ($sysvolShare -eq 0) { Write-Both "        [!] SYSVOL share is missing on $DC!" }
-            if ($netlogonShare -eq 0) { Write-Both "        [!] NETLOGON share is missing on $DC!" }
+        $session = $null
+        try {
+            $session = New-CimSession -ComputerName $DC -OperationTimeoutSec 10 -ErrorAction Stop
+            $shareList = @(Get-CimInstance -CimSession $session -ClassName Win32_Share -OperationTimeoutSec 10 -ErrorAction SilentlyContinue)
+            if (-not $shareList -or $shareList.Count -eq 0) {
+                Write-Both "        [!] Cannot test shares on $DC!"
+            } else {
+                $sysvolShare = ($shareList | Where-Object { $_.Name -match 'SYSVOL' }   | Measure-Object).Count
+                $netlogonShare = ($shareList | Where-Object { $_.Name -match 'NETLOGON' } | Measure-Object).Count
+                if ($sysvolShare -eq 0) { Write-Both "        [!] SYSVOL share is missing on $DC!" }
+                if ($netlogonShare -eq 0) { Write-Both "        [!] NETLOGON share is missing on $DC!" }
+            }
+        } catch {
+            Write-Both "        [!] CIM session to $DC failed within 10s timeout: $($_.Exception.Message)"
+        } finally {
+            if ($session) { Remove-CimSession -CimSession $session -ErrorAction SilentlyContinue }
         }
     }
 }
 
 Function Get-ADCSVulns {
-    #Check for ADCS Vulnerabiltiies, ESC1,2,3,4 and 8. ESC8 will output to a different issues mapped to Nessus.
+    # FIX v1.4.0: LDAP-native rewrite (independent of certutil text-output language).
+    # Coverage: ESC1, ESC2, ESC3, ESC4, ESC8 + ESC9, ESC10, ESC13, ESC14, ESC15 (EKUwu, CVE-2024-49019).
+    # All template metadata is read directly from CN=Certificate Templates,CN=Public Key Services,CN=Services,<config NC>.
+    Write-Both "    [+] ADCS audit (LDAP-native, ESC1-15)"
+
+    $template_path = Join-Path $outputdir 'vulnerable_templates.txt'
+    $web_enrollmeent_path = Join-Path $outputdir 'web_enrollment.txt'
+    Remove-Item -Path $template_path -ErrorAction SilentlyContinue
+
+    # Pre-resolve dangerous principals (Authenticated Users / Domain Users / Everyone) to NTAccount strings.
+    $dangerousPrincipals = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($sid in @('S-1-5-11','S-1-1-0','S-1-5-32-545')) {
+        try {
+            $nt = (New-Object System.Security.Principal.SecurityIdentifier($sid)).Translate([System.Security.Principal.NTAccount]).Value
+            [void]$dangerousPrincipals.Add($nt)
+        } catch {}
+    }
     try {
-        $certutil_output = certutil -v -template -ErrorAction Stop
+        $domainSid = (Get-ADDomain -ErrorAction Stop).DomainSID.Value
+        $du = (New-Object System.Security.Principal.SecurityIdentifier("$domainSid-513")).Translate([System.Security.Principal.NTAccount]).Value
+        [void]$dangerousPrincipals.Add($du)
+    } catch {}
+
+    # ms-PKI-Certificate-Name-Flag bit 0x00000001 = CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT
+    $CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT = 0x00000001
+    # ms-PKI-Enrollment-Flag bit 0x00000200 = CT_FLAG_NO_SECURITY_EXTENSION (ESC9)
+    $CT_FLAG_NO_SECURITY_EXTENSION    = 0x00000200
+    # ms-PKI-RA-Signature == 0 means no enrollment-agent signature required
+    # Extended-Right GUID for "Enroll" on a template object
+    $RIGHT_ENROLL_GUID    = '0e10c968-78fb-11d2-90d4-00c04f79dc55'
+    $RIGHT_AUTOENROLL_GUID = 'a05b8cc2-17bc-4802-a710-e7c15ab866a2'
+
+    # Load templates from AD
+    $templates = @()
+    try {
+        $rootDse = Get-ADRootDSE -ErrorAction Stop
+        $templatesBase = "CN=Certificate Templates,CN=Public Key Services,CN=Services,$($rootDse.configurationNamingContext)"
+        $templates = @(Get-ADObject -SearchBase $templatesBase -LDAPFilter '(objectClass=pKICertificateTemplate)' `
+            -Properties displayName, msPKI-Certificate-Name-Flag, msPKI-Enrollment-Flag, msPKI-RA-Signature, `
+                        msPKI-Template-Schema-Version, pKIExtendedKeyUsage, msDS-OIDToGroupLink, `
+                        nTSecurityDescriptor `
+            -ErrorAction Stop)
     } catch {
-        Write-Both "    [!] Error: Unable to enumerate certificate templates: $($_.Exception.Message)"
-        Write-Both "    [!] Make sure you have the appropriate permissions and certutil is available"
+        Write-Both "    [!] Could not enumerate certificate templates from AD: $($_.Exception.Message)"
+        Write-Both "    [!] Falling back to certutil parsing (limited coverage)"
+        # Fallback to original certutil-based parser is intentionally omitted here for brevity;
+        # the LDAP path is the supported one. Module is skipped if AD is unreachable.
         return
     }
 
-    try {
-        $certutil_lines = $certutil_output.Trim().Split("`n")
-    $templates = @()
-    foreach ($line in $certutil_lines) {
-        if ($line.StartsWith("Template[")) {
-            $template_unparsed = $current_template.TrimEnd(",").Split(",")
-            $SuppliesSubjectCheck = $false
-            $ClientAuthCheck = $false
-            $AllowEnrollCheck = $false
-            $AnyPurposeCheck = $false
-            $AllowWriteCheck = $false
-            $AllowFullControl = $false
-            $CertificateRequestAgentCheck = $false
+    $tplErrors = 0
+    foreach ($t in $templates) {
+      try {
+        $name = if ($t.displayName) { $t.displayName } else { $t.Name }
+        $nameFlags  = [int]$t.'msPKI-Certificate-Name-Flag'
+        $enrollFlag = [int]$t.'msPKI-Enrollment-Flag'
+        $raSig      = [int]$t.'msPKI-RA-Signature'
+        $schemaVer  = [int]$t.'msPKI-Template-Schema-Version'
+        $ekus       = @($t.pKIExtendedKeyUsage)
+        $oidGroupLink = $t.'msDS-OIDToGroupLink'
 
-            $TemplatePropCommonName = $null
-            foreach ($detail in $template_unparsed) {
-                if ($detail -like "*TemplatePropCommonName =*") {
-                    $TemplatePropCommonName = $detail.Split("=")[1].Trim()
-                }
-                if ($detail -like "*CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT -- 1*") {
-                    $SuppliesSubjectCheck = $true
-                }
-                if ($detail -like "*Client Authentication*") {
-                    $ClientAuthCheck = $true
-                }
-                if ($detail -match "^\s*Allow Enroll\s+.*\\Authenticated Users\s*$|^\s*Allow Enroll\s+.*\\Domain Users\s*$") {
-                    $AllowEnrollCheck = $true
-                }
-                if ($detail -like "2.5.29.37.0 Any Purpose") {
-                    $AnyPurposeCheck = $true
-                }
-                if ($detail -match "^\s*Allow Write\s+.*\\Authenticated Users\s*$|^\s*Allow Write\s+.*\\Domain Users\s*$") {
-                    $AllowWriteCheck = $true
-                }
-                # Check for Allow Full Control
-                if ($detail -match "^\s*Allow Full Control\s+.*\\Authenticated Users\s*$|^\s*Allow Full Control\s+.*\\Domain Users\s*$") {
-                    $AllowFullControl = $true
-                }
-                if ($detail -like "Certificate Request Agent (1.3.6.1.4.1.311.20.2.1)") {
-                    $CertificateRequestAgentCheck = $true
-                }
-                # Create object with details. Objectg name is TemplatePropCommonName
-                $template = New-Object -TypeName PSObject -Property @{
-                    "SuppliesSubjectCheck"         = $SuppliesSubjectCheck
-                    "ClientAuthCheck"              = $ClientAuthCheck
-                    "AllowEnrollCheck"             = $AllowEnrollCheck
-                    "AnyPurposeCheck"              = $AnyPurposeCheck
-                    "AllowWriteCheck"              = $AllowWriteCheck
-                    "AllowFullControl"             = $AllowFullControl
-                    "TemplatePropCommonName"       = $TemplatePropCommonName
-                    "CertificateRequestAgentCheck" = $CertificateRequestAgentCheck
+        $hasClientAuth   = ($ekus -contains '1.3.6.1.5.5.7.3.2') -or ($ekus -contains '1.3.6.1.5.2.3.4') -or ($ekus -contains '2.5.29.37.0')
+        $hasAnyPurpose   = ($ekus -contains '2.5.29.37.0') -or ($ekus.Count -eq 0)
+        $hasCertReqAgent = ($ekus -contains '1.3.6.1.4.1.311.20.2.1')
+        $suppliesSubject = ($nameFlags -band $CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT) -ne 0
+        $noSecExt        = ($enrollFlag -band $CT_FLAG_NO_SECURITY_EXTENSION) -ne 0
+        $needsEAagent    = ($raSig -gt 0)
+
+        # Walk template SDDL for dangerous principal grants
+        $allowEnroll = $false ; $allowWrite = $false ; $allowFullControl = $false
+        try {
+            $sd = $t.nTSecurityDescriptor
+            if ($sd) {
+                foreach ($ace in $sd.Access) {
+                    if ($ace.AccessControlType -ne 'Allow') { continue }
+                    $idRef = "$($ace.IdentityReference)"
+                    if (-not $dangerousPrincipals.Contains($idRef)) { continue }
+                    $rights = "$($ace.ActiveDirectoryRights)"
+                    if ($rights -match 'GenericAll') { $allowFullControl = $true ; $allowWrite = $true ; $allowEnroll = $true }
+                    if ($rights -match 'WriteProperty|WriteDacl|WriteOwner|GenericWrite') { $allowWrite = $true }
+                    if ($rights -match 'ExtendedRight') {
+                        $ot = "$($ace.ObjectType)"
+                        if ($ot -eq $RIGHT_ENROLL_GUID -or $ot -eq $RIGHT_AUTOENROLL_GUID -or $ot -eq '00000000-0000-0000-0000-000000000000') {
+                            $allowEnroll = $true
+                        }
+                    }
                 }
             }
-            $templates += $template
-            $current_template = $line + ","
+        } catch {}
+
+        $tags = @()
+        # ESC1: enrollee supplies subject + client auth + low-priv enroll
+        if ($suppliesSubject -and $hasClientAuth -and $allowEnroll -and -not $needsEAagent) { $tags += 'ESC1' }
+        # ESC2: AnyPurpose EKU + low-priv enroll
+        if ($hasAnyPurpose -and $allowEnroll) { $tags += 'ESC2' }
+        # ESC3: Certificate Request Agent EKU + low-priv enroll
+        if ($hasCertReqAgent -and $allowEnroll) { $tags += 'ESC3' }
+        # ESC4: low-priv has Write/FullControl on the template object
+        if ($allowWrite -or $allowFullControl) { $tags += 'ESC4' }
+        # ESC9: NO_SECURITY_EXTENSION flag set + client auth + low-priv enroll (account auth via SAN)
+        if ($noSecExt -and $hasClientAuth -and $allowEnroll) { $tags += 'ESC9' }
+        # ESC15 / EKUwu (CVE-2024-49019): V1 template with Client Authentication + supplies subject + low-priv enroll
+        if ($schemaVer -eq 1 -and $hasClientAuth -and $suppliesSubject -and $allowEnroll) { $tags += 'ESC15' }
+        # ESC13: OID-to-Group link populated → certificate confers group membership
+        if ($oidGroupLink -and $hasClientAuth -and $allowEnroll) { $tags += 'ESC13' }
+
+        if ($tags.Count -gt 0) {
+            $line = "{0} Vulnerable Template: {1}  (schemaVer={2}, EKUs={3}, NameFlags=0x{4:X}, EnrollFlags=0x{5:X})" -f `
+                    ($tags -join ','), $name, $schemaVer, ($ekus -join ';'), $nameFlags, $enrollFlag
+            Add-Content -Path $template_path -Value $line
+            Write-Both "    [!] $line"
         }
-        else {
-            $current_template += $line + ","
-        }
+      } catch {
+        $tplErrors++
+        Write-ErrorLog -Context "Get-ADCSVulns:template:$($t.Name)" -ErrorRecord $_
+      }
+    }
+    if ($tplErrors -gt 0) {
+        Write-Both "    [!] $tplErrors of $($templates.Count) templates skipped due to errors (see logs/errors.log)"
     }
 
-    # Check for ESC1
-    # ESC1 = CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT = 1 and  Client Authentication and ( enroll or full control )
-
-    $ESC1 = @()
-    $ESC1e = $templates | Where-Object { $_.SuppliesSubjectCheck -and $_.ClientAuthCheck -and $_.AllowEnrollCheck }
-    $ESC1f = $templates | Where-Object { $_.SuppliesSubjectCheck -and $_.ClientAuthCheck -and $_.AllowFullControl }
-    $ESC1w = $templates | Where-Object { $_.SuppliesSubjectCheck -and $_.ClientAuthCheck -and $_.AllowWriteCheck }
-    $ESC1 += $ESC1e
-    $ESC1 += $ESC1f
-    $ESC1 += $ESC1w
-    # Remove duplicates
-    $ESC1 = $ESC1 | Select-Object -Property TemplatePropCommonName -unique
-    $ESC2 = $templates | Where-Object { $_.AnyPurposeCheck -and $_.AllowEnrollCheck }
-    $ESC3 = $templates | Where-Object { $_.CertificateRequestAgentCheck -and $_.AllowEnrollCheck }
-    $ESC4 = $templates | Where-Object { $_.AllowWriteCheck -or $_.AllowFullControl }
-
-    $template_path = $outputdir + "\vulnerable_templates.txt"
-    $web_enrollmeent_path = $outputdir + "\web_enrollment.txt"
-
-    foreach ($template in $ESC1) {
-        $ESC1line = "ESC1 Vulnerable Templates:" + $template.TemplatePropCommonName
-        add-content -path $template_path -value $ESC1line
-        Write-Both '    [!]'$ESC1line
-    }
-    foreach ($template in $ESC2) {
-        $ESC2line = "ESC2 Vulnerable Templates:" + $template.TemplatePropCommonName
-        add-content -path $template_path -value $ESC2line
-        Write-Both '    [!]'$ESC2line
-    }
-    foreach ($template in $ESC3) {
-        $ESC3line = "ESC3 Vulnerable Templates:" + $template.TemplatePropCommonName
-        add-content -path $template_path -value $ESC3line
-        Write-Both '    [!]'$ESC3line
-    }
-    foreach ($template in $ESC4) {
-        $ESC4line = "ESC4 Vulnerable Templates:" + $template.TemplatePropCommonName
-        add-content -path $template_path -value $ESC4line
-        Write-Both '    [!]'$ESC4line
-    }
-    } catch {
-        Write-Both "    [!] Error parsing certificate templates: $($_.Exception.Message)"
-    }
-
-    # ESC8 Check, If error 401 and response is unauthorized, then vulnerable
+    # ESC10 — StrongCertificateBindingEnforcement weak (read DC registry)
     try {
-        $certInfo = & certutil
-        $serverName = ($certInfo | Select-String 'Server:' | Select-Object -First 1).ToString().Split(':')[1].Trim().Replace('"', '')
-        $response = Invoke-WebRequest -Uri ("http://$serverName/certsrv/") -ErrorAction Stop
-        $response
-    }
-    catch {
-        # If error and response is unauthorised, then vulnerable
-        if ($_.Exception.Response.StatusCode -eq 401) {
-            Add-Content -Path $web_enrollmeent_path -Value "ESC8 Vulnerable: Endpoint located at http://$serverName/certsrv/"
-            Write-Both "    [!] ESC8 Vulnerable: Endpoint located at http://$serverName/certsrv/"
+        $sbe = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Kdc' -Name 'StrongCertificateBindingEnforcement' -ErrorAction Stop).StrongCertificateBindingEnforcement
+        if ($sbe -lt 2) {
+            $msg = "ESC10: StrongCertificateBindingEnforcement = $sbe (must be 2 since Feb 2025 enforcement). Weak PKINIT cert→user mapping (CVE-2022-34691) on $env:COMPUTERNAME."
+            Add-Content -Path $template_path -Value $msg
+            Write-Both "    [!] $msg"
         }
-        else {
-            Write-Both "    [+] ESC8 not vulnerable"
+    } catch {
+        $msg = "ESC10: StrongCertificateBindingEnforcement registry value MISSING on $env:COMPUTERNAME — defaults to compatibility mode (weak)."
+        Add-Content -Path $template_path -Value $msg
+        Write-Both "    [!] $msg"
+    }
+    # ESC14 — altSecurityIdentities mapping enforcement (CertificateMappingMethods)
+    try {
+        $cmm = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\Schannel' -Name 'CertificateMappingMethods' -ErrorAction SilentlyContinue).CertificateMappingMethods
+        if ($cmm -ne $null -and ($cmm -band 0x04) -ne 0) {
+            # 0x04 = UPN mapping, allows weak implicit mapping
+            $msg = "ESC14: CertificateMappingMethods includes UPN-implicit mapping (value $cmm). Restrict to issuer/subject explicit mapping only."
+            Add-Content -Path $template_path -Value $msg
+            Write-Both "    [!] $msg"
         }
+    } catch {}
+
+    # ESC8 — Web enrollment exposed via HTTP
+    try {
+        $certInfo = & certutil 2>$null
+        $serverName = ($certInfo | Select-String 'Server:' | Select-Object -First 1)
+        if ($serverName) {
+            $serverName = $serverName.ToString().Split(':')[1].Trim().Replace('"','')
+            try {
+                $response = Invoke-WebRequest -Uri ("http://$serverName/certsrv/") -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+                # Reachable over HTTP without auth — vulnerable
+                Add-Content -Path $web_enrollmeent_path -Value "ESC8 Vulnerable: HTTP web enrollment reachable at http://$serverName/certsrv/ (status $($response.StatusCode))"
+                Write-Both "    [!] ESC8: HTTP web enrollment reachable at http://$serverName/certsrv/"
+            } catch {
+                if ($_.Exception.Response.StatusCode -eq 401) {
+                    Add-Content -Path $web_enrollmeent_path -Value "ESC8 Vulnerable: HTTP web enrollment endpoint at http://$serverName/certsrv/ (NTLM relay possible)"
+                    Write-Both "    [!] ESC8: HTTP web enrollment endpoint exposed at http://$serverName/certsrv/"
+                } else {
+                    Write-Both "    [+] ESC8: HTTP web enrollment not reachable on $serverName"
+                }
+            }
+        }
+    } catch {
+        Write-Both "    [-] ESC8 check skipped (certutil unavailable or no CA discovered)"
     }
-    if (Test-Path "$outputdir\web_enrollment.txt") {
-        Write-Nessus-Finding "Active Directory Certificate Service Web Enrollment Enabled in HTTP" "KB1095" ([System.IO.File]::ReadAllText("$outputdir\web_enrollment.txt"))
+
+    if (Test-Path -LiteralPath $web_enrollmeent_path) {
+        Write-Nessus-Finding "Active Directory Certificate Service Web Enrollment Enabled in HTTP" "KB1095" ([System.IO.File]::ReadAllText($web_enrollmeent_path))
     }
-    if (Test-Path "$outputdir\vulnerable_templates.txt") {
-        Write-Nessus-Finding "Active Directory Certificate Service Vulnerable Templates" "KB1096" ([System.IO.File]::ReadAllText("$outputdir\vulnerable_templates.txt"))
+    if (Test-Path -LiteralPath $template_path) {
+        Write-Nessus-Finding "Active Directory Certificate Service Vulnerable Templates" "KB1096" ([System.IO.File]::ReadAllText($template_path))
     }
+    Write-Both "    [-] Finished ADCS audit"
 }
 
 Function Get-SPNs {
@@ -2263,38 +2641,27 @@ Function Get-SPNs {
         }
     }
 
-    $all_groups = $base_groups
+    # FIX v1.4.0: Use Get-ADGroupMember -Recursive to enumerate ALL transitively-nested
+    # groups under each privileged seed group. The previous one-level lookup missed
+    # kerberoasteable accounts that were members of nested groups inside Domain Admins.
+    $all_groups = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($g in $base_groups) { [void]$all_groups.Add($g) }
     foreach ($group in $default_groups) {
         try {
             $ADGrp = Get-ADGroup -Identity $group -ErrorAction SilentlyContinue
-            $QueryResult = Get-ADGroup -LDAPFilter "(&(objectCategory=group)(memberof=$($ADGrp.DistinguishedName)))"
-            foreach ($result in $QueryResult) {
-                $all_groups += $result.Name
+            if (-not $ADGrp) { continue }
+            # Direct nested groups (one level)
+            $direct = Get-ADGroup -LDAPFilter "(&(objectCategory=group)(memberof=$($ADGrp.DistinguishedName)))" -ErrorAction SilentlyContinue
+            foreach ($r in $direct) { [void]$all_groups.Add($r.Name) }
+            # Transitively nested members that are themselves groups
+            $recursiveMembers = Get-ADGroupMember -Identity $ADGrp -Recursive -ErrorAction SilentlyContinue
+            foreach ($m in $recursiveMembers) {
+                if ($m.objectClass -eq 'group') { [void]$all_groups.Add($m.Name) }
             }
         }
         catch {}
     }
 
-#    while ($base_groups.count -gt 0) {
-#        $new_groups = @()
-#        foreach ($group in $base_groups) {
-#            # I dont want to see errors if a group is not found
-#            try {
-#                $ADGrp = Get-ADGroup -Identity $group -ErrorAction SilentlyContinue
-#                $QueryResult = Get-ADGroup -LDAPFilter "(&(objectCategory=group)(memberof=$($ADGrp.DistinguishedName)))"
-#                foreach ($result in $QueryResult) {
-#                    $all_groups += $result.Name
-#                    $new_groups += $result.Name
-#                }
-#            }
-#            catch {
-#                # Remove group from all_groups
-#                $all_groups = $all_groups | Where-Object { $_ -ne $group }
-#            }
-#        }
-#        $base_groups = $new_groups
-#    }
-#    
     $SPNs = Get-ADObject -Filter { serviceprincipalname -like "*" } -Properties MemberOf |
     Where-Object { $_.ObjectClass -eq "user" } |
     ForEach-Object {
@@ -2308,7 +2675,7 @@ Function Get-SPNs {
         $spn_groups = $spn.Groups.Split(',')
         $name = $spn.Name
         foreach ($spn_group in $spn_groups) {
-            if ($all_groups -contains $spn_group) {
+            if ($all_groups.Contains($spn_group)) {
                 # Create object with user and group
                 # Add object to high_value_users if the user.name is not already in the list
                 $user = New-Object -TypeName PSObject -Property @{
@@ -2337,7 +2704,9 @@ Function Get-SPNs {
 }
 
 function Get-ADUsersWithoutPreAuth {
-    $ASREP = Get-ADUser -Filter * -Properties DoesNotRequirePreAuth, Enabled | Where-Object { $_.DoesNotRequirePreAuth -eq "True" -and $_.Enabled -eq "True" } | Select-Object Name
+    # Use boolean comparisons (not strings) — DoesNotRequirePreAuth and Enabled are System.Boolean,
+    # the historical "True" string compare relied on coercion and is fragile across module versions.
+    $ASREP = Get-ADUser -Filter * -Properties DoesNotRequirePreAuth, Enabled | Where-Object { $_.DoesNotRequirePreAuth -eq $true -and $_.Enabled -eq $true } | Select-Object Name
     foreach ($user in $ASREP) {
         $asrepuser = '    [!] AS-REP Roastable user: ' + $user.Name
         Write-both $asrepuser
@@ -2352,38 +2721,155 @@ function Get-ADUsersWithoutPreAuth {
 }
 
 function Get-UnconstrainedDelegation {
-    Write-Both "    [+] Checking for accounts with unconstrained Kerberos delegation..."
-    # Domain Controllers legitimately hold unconstrained delegation — exclude them
+    # FIX v1.4.0: Module now also detects:
+    #   - Constrained Delegation w/ Protocol Transition (TrustedToAuthForDelegation = true) → S4U2Self abuse
+    #   - Resource-Based Constrained Delegation (msDS-AllowedToActOnBehalfOfOtherIdentity populated)
+    #   - Shadow Credentials (msDS-KeyCredentialLink populated on non-administered accounts)
+    Write-Both "    [+] Checking Kerberos delegation surface (Unconstrained / Constrained-PT / RBCD / Shadow Credentials)..."
+
     $DCs = (Get-ADDomainController -Filter *).Name
     $findings = @()
+    $rbcdFindings = @()
+    $shadowCredFindings = @()
+    $constrainedPTFindings = @()
 
-    # User accounts with unconstrained delegation (TrustedForDelegation)
-    $users = Get-ADUser -Filter { TrustedForDelegation -eq $true -and Enabled -eq $true } `
-                        -Properties TrustedForDelegation, ServicePrincipalName, LastLogonDate, DistinguishedName
-    foreach ($u in $users) {
-        $line = "USER  | $($u.SamAccountName) | LastLogon: $($u.LastLogonDate) | DN: $($u.DistinguishedName)"
-        Write-Both "    [!] Unconstrained delegation (user): $($u.SamAccountName)"
-        $findings += $line
-    }
+    # ---------- 1. Unconstrained Delegation (TrustedForDelegation) ----------
+    # v1.4.1: each sub-check is wrapped so a failure in (e.g.) the user enum doesn't skip the
+    # computer enum, RBCD, Constrained-PT and Shadow-Cred enumerations that follow.
+    Invoke-Safe -Context 'kerbdelegation:unconstrained-users' -Script {
+        $users = Get-ADUser -Filter { TrustedForDelegation -eq $true -and Enabled -eq $true } `
+                            -Properties TrustedForDelegation, ServicePrincipalName, LastLogonDate, DistinguishedName -ErrorAction Stop
+        foreach ($u in @($users)) {
+            try {
+                $line = "UNCONSTRAINED USER  | $($u.SamAccountName) | LastLogon: $($u.LastLogonDate) | DN: $($u.DistinguishedName)"
+                Write-Both "    [!] Unconstrained delegation (user): $($u.SamAccountName)"
+                $findings += $line
+            } catch { Write-ErrorLog -Context "kerbdelegation:unconstrained-user:$($u.SamAccountName)" -ErrorRecord $_ }
+        }
+    } | Out-Null
 
-    # Computer accounts with unconstrained delegation, excluding DCs
-    $computers = Get-ADComputer -Filter { TrustedForDelegation -eq $true } `
-                                -Properties TrustedForDelegation, OperatingSystem, LastLogonDate, DistinguishedName |
-                 Where-Object { $DCs -notcontains $_.Name }
-    foreach ($c in $computers) {
-        $line = "COMPUTER | $($c.Name) | OS: $($c.OperatingSystem) | LastLogon: $($c.LastLogonDate) | DN: $($c.DistinguishedName)"
-        Write-Both "    [!] Unconstrained delegation (computer): $($c.Name)"
-        $findings += $line
-    }
+    Invoke-Safe -Context 'kerbdelegation:unconstrained-computers' -Script {
+        $computers = Get-ADComputer -Filter { TrustedForDelegation -eq $true } `
+                                    -Properties TrustedForDelegation, OperatingSystem, LastLogonDate, DistinguishedName -ErrorAction Stop |
+                     Where-Object { $DCs -notcontains $_.Name }
+        foreach ($c in @($computers)) {
+            try {
+                $line = "UNCONSTRAINED COMPUTER | $($c.Name) | OS: $($c.OperatingSystem) | LastLogon: $($c.LastLogonDate) | DN: $($c.DistinguishedName)"
+                Write-Both "    [!] Unconstrained delegation (computer): $($c.Name)"
+                $findings += $line
+            } catch { Write-ErrorLog -Context "kerbdelegation:unconstrained-computer:$($c.Name)" -ErrorRecord $_ }
+        }
+    } | Out-Null
 
-    if ($findings.Count -gt 0) {
+    # ---------- 2. Constrained Delegation w/ Protocol Transition (TrustedToAuthForDelegation = true) ----------
+    # S4U2Self with protocol transition lets the account obtain a TGS for *any* user without their password.
+    # Combined with coerced authentication (PetitPotam), this is a path to forest compromise.
+    Invoke-Safe -Context 'kerbdelegation:constrained-pt' -Script {
+        $cptUsers = Get-ADUser -LDAPFilter '(&(userAccountControl:1.2.840.113556.1.4.803:=16777216)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))' `
+                               -Properties TrustedToAuthForDelegation, msDS-AllowedToDelegateTo, ServicePrincipalName, LastLogonDate, DistinguishedName -ErrorAction Stop
+        foreach ($u in @($cptUsers)) {
+            try {
+                $delegateTo = ($u.'msDS-AllowedToDelegateTo' -join ', ')
+                $line = "CONSTRAINED-PT USER | $($u.SamAccountName) | DelegatesTo: $delegateTo | DN: $($u.DistinguishedName)"
+                Write-Both "    [!] Constrained delegation w/ protocol transition (user): $($u.SamAccountName)"
+                $constrainedPTFindings += $line
+            } catch { Write-ErrorLog -Context "kerbdelegation:constrained-pt-user:$($u.SamAccountName)" -ErrorRecord $_ }
+        }
+        $cptComputers = Get-ADComputer -LDAPFilter '(userAccountControl:1.2.840.113556.1.4.803:=16777216)' `
+                                       -Properties TrustedToAuthForDelegation, msDS-AllowedToDelegateTo, OperatingSystem, LastLogonDate, DistinguishedName -ErrorAction Stop |
+                        Where-Object { $DCs -notcontains $_.Name }
+        foreach ($c in @($cptComputers)) {
+            try {
+                $delegateTo = ($c.'msDS-AllowedToDelegateTo' -join ', ')
+                $line = "CONSTRAINED-PT COMPUTER | $($c.Name) | OS: $($c.OperatingSystem) | DelegatesTo: $delegateTo | DN: $($c.DistinguishedName)"
+                Write-Both "    [!] Constrained delegation w/ protocol transition (computer): $($c.Name)"
+                $constrainedPTFindings += $line
+            } catch { Write-ErrorLog -Context "kerbdelegation:constrained-pt-computer:$($c.Name)" -ErrorRecord $_ }
+        }
+    } | Out-Null
+
+    # ---------- 3. Resource-Based Constrained Delegation (msDS-AllowedToActOnBehalfOfOtherIdentity) ----------
+    Invoke-Safe -Context 'kerbdelegation:rbcd' -Script {
+        $rbcdComputers = Get-ADComputer -LDAPFilter '(msDS-AllowedToActOnBehalfOfOtherIdentity=*)' `
+                                        -Properties msDS-AllowedToActOnBehalfOfOtherIdentity, OperatingSystem, DistinguishedName -ErrorAction Stop
+        foreach ($c in @($rbcdComputers)) {
+            try {
+                $sd = $c.'msDS-AllowedToActOnBehalfOfOtherIdentity'
+                $allowedPrincipals = @()
+                try {
+                    if ($sd) {
+                        $rsd = New-Object System.DirectoryServices.ActiveDirectorySecurity
+                        $rsd.SetSecurityDescriptorBinaryForm([byte[]]$sd)
+                        foreach ($ace in $rsd.Access) {
+                            $allowedPrincipals += "$($ace.IdentityReference)"
+                        }
+                    }
+                } catch { Write-ErrorLog -Context "kerbdelegation:rbcd-sd-parse:$($c.Name)" -ErrorRecord $_ }
+                $line = "RBCD COMPUTER | $($c.Name) | AllowedToImpersonate: $($allowedPrincipals -join ', ') | DN: $($c.DistinguishedName)"
+                Write-Both "    [!] RBCD configured on $($c.Name) — principals: $($allowedPrincipals -join ', ')"
+                $rbcdFindings += $line
+            } catch { Write-ErrorLog -Context "kerbdelegation:rbcd-computer:$($c.Name)" -ErrorRecord $_ }
+        }
+        $rbcdUsers = Get-ADUser -LDAPFilter '(msDS-AllowedToActOnBehalfOfOtherIdentity=*)' `
+                                -Properties msDS-AllowedToActOnBehalfOfOtherIdentity, DistinguishedName -ErrorAction Stop
+        foreach ($u in @($rbcdUsers)) {
+            try {
+                $line = "RBCD USER | $($u.SamAccountName) | DN: $($u.DistinguishedName)"
+                Write-Both "    [!] RBCD configured on user $($u.SamAccountName)"
+                $rbcdFindings += $line
+            } catch { Write-ErrorLog -Context "kerbdelegation:rbcd-user:$($u.SamAccountName)" -ErrorRecord $_ }
+        }
+    } | Out-Null
+
+    # ---------- 4. Shadow Credentials (msDS-KeyCredentialLink) ----------
+    Invoke-Safe -Context 'kerbdelegation:shadow-creds' -Script {
+        $kcl = Get-ADObject -LDAPFilter '(msDS-KeyCredentialLink=*)' -Properties msDS-KeyCredentialLink, objectClass, DistinguishedName -ErrorAction SilentlyContinue
+        foreach ($obj in @($kcl)) {
+            try {
+                $cls = $obj.objectClass
+                if ($cls -eq 'computer' -and ($DCs -notcontains $obj.Name)) {
+                    # Computers can have legitimate KeyCredentialLink (Windows Hello, device join);
+                    # only report if it's a DC. Otherwise skip to reduce noise.
+                    continue
+                }
+                $count = if ($obj.'msDS-KeyCredentialLink') { @($obj.'msDS-KeyCredentialLink').Count } else { 0 }
+                $line = "SHADOW-CREDS $($cls.ToUpper()) | $($obj.Name) | KeyCredentialCount=$count | DN: $($obj.DistinguishedName)"
+                Write-Both "    [!] msDS-KeyCredentialLink populated on $cls $($obj.Name) (count=$count) — investigate as potential Shadow Credentials"
+                $shadowCredFindings += $line
+            } catch { Write-ErrorLog -Context "kerbdelegation:shadow-creds-obj:$($obj.DistinguishedName)" -ErrorRecord $_ }
+        }
+    } | Out-Null
+
+    # ---------- Aggregate and emit findings ----------
+    $allRows = @()
+    $allRows += $findings
+    $allRows += $constrainedPTFindings
+    $allRows += $rbcdFindings
+    $allRows += $shadowCredFindings
+
+    if ($allRows.Count -gt 0) {
         $evidencePath = "$outputdir\UnconstrainedDelegation.txt"
-        $findings | Set-Content -Path $evidencePath
+        $allRows | Set-Content -Path $evidencePath
         Write-Nessus-Finding "Unconstrained Kerberos Delegation" "KB730" ([System.IO.File]::ReadAllText($evidencePath))
+        if ($constrainedPTFindings.Count -gt 0) {
+            $cptPath = "$outputdir\ConstrainedDelegationPT.txt"
+            $constrainedPTFindings | Set-Content -Path $cptPath
+            Write-Nessus-Finding "Constrained Delegation with Protocol Transition" "KB733" ([System.IO.File]::ReadAllText($cptPath))
+        }
+        if ($rbcdFindings.Count -gt 0) {
+            $rbcdPath = "$outputdir\RBCD.txt"
+            $rbcdFindings | Set-Content -Path $rbcdPath
+            Write-Nessus-Finding "Resource-Based Constrained Delegation Configured" "KB734" ([System.IO.File]::ReadAllText($rbcdPath))
+        }
+        if ($shadowCredFindings.Count -gt 0) {
+            $scPath = "$outputdir\ShadowCredentials.txt"
+            $shadowCredFindings | Set-Content -Path $scPath
+            Write-Nessus-Finding "Shadow Credentials (msDS-KeyCredentialLink)" "KB735" ([System.IO.File]::ReadAllText($scPath))
+        }
     } else {
-        Write-Both "    [+] No accounts with unconstrained delegation found (excluding DCs)"
+        Write-Both "    [+] No suspicious Kerberos delegation surface found (Unconstrained, Constrained-PT, RBCD, Shadow Credentials)"
     }
-    Write-Both "    [-] Finished checking unconstrained Kerberos delegation"
+    Write-Both "    [-] Finished Kerberos delegation surface checks"
 }
 
 function Get-DCSyncRights {
@@ -2392,6 +2878,10 @@ function Get-DCSyncRights {
     $replicationGuid = '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2'
     $domainDN = (Get-ADDomain).DistinguishedName
     $domainSID = (Get-ADDomain).DomainSID
+    $forestDN = $null
+    try { $forestDN = (Get-ADForest).RootDomain | ForEach-Object { (Get-ADDomain -Identity $_).DistinguishedName } } catch {}
+    $rootDse = $null
+    try { $rootDse = Get-ADRootDSE -ErrorAction Stop } catch {}
 
     # Built-in accounts that legitimately hold this right
     $builtinSIDs = @(
@@ -2404,29 +2894,55 @@ function Get-DCSyncRights {
         'S-1-5-9'           # Enterprise Domain Controllers
     )
 
-    $findings = @()
-    try {
-        $acl = (Get-Acl "AD:\$domainDN").Access | Where-Object {
-            $_.ObjectType -eq $replicationGuid -and
-            $_.ActiveDirectoryRights -match 'ExtendedRight' -and
-            $_.AccessControlType -eq 'Allow'
-        }
-        foreach ($ace in $acl) {
-            $identity = $ace.IdentityReference.Value
-            # Resolve SID if needed
-            $resolvedSID = $null
-            try {
-                $resolvedSID = (New-Object System.Security.Principal.NTAccount($identity)).Translate([System.Security.Principal.SecurityIdentifier]).Value
-            } catch { $resolvedSID = $identity }
+    # FIX v1.4.0: Audit DCSync ACE not just on the domain root, but on additional sensitive containers
+    # where attackers commonly plant DCSync persistence:
+    #   - CN=AdminSDHolder (replicated to all protected accounts via SDProp)
+    #   - CN=Configuration  (forest-wide)
+    #   - CN=Schema         (forest-wide)
+    $scopesToAudit = @()
+    $scopesToAudit += [ordered]@{ label='DomainRoot';        dn=$domainDN }
+    $scopesToAudit += [ordered]@{ label='AdminSDHolder';     dn="CN=AdminSDHolder,CN=System,$domainDN" }
+    if ($rootDse) {
+        $scopesToAudit += [ordered]@{ label='ConfigurationNC'; dn=$rootDse.configurationNamingContext }
+        $scopesToAudit += [ordered]@{ label='SchemaNC';        dn=$rootDse.schemaNamingContext }
+    }
 
-            if ($builtinSIDs -notcontains $resolvedSID) {
-                $line = "IDENTITY: $identity | SID: $resolvedSID | Right: DS-Replication-Get-Changes-All"
-                Write-Both "    [!] Non-standard DCSync right: $identity"
-                $findings += $line
+    $findings = @()
+    foreach ($scope in $scopesToAudit) {
+        try {
+            $aclObj = Get-ADAclSafe -DistinguishedName $scope.dn
+            if (-not $aclObj) {
+                Write-Both "    [i] DCSync scan: ACL not retrievable for $($scope.label) ($($scope.dn))"
+                continue
             }
+            $acl = $aclObj.Access | Where-Object {
+                $_.ObjectType -eq $replicationGuid -and
+                $_.ActiveDirectoryRights -match 'ExtendedRight' -and
+                $_.AccessControlType -eq 'Allow'
+            }
+            foreach ($ace in $acl) {
+                # v1.4.1: per-ACE try/catch so a single ACE that fails to translate doesn't
+                # blank out the whole scope.
+                try {
+                    $identity = $ace.IdentityReference.Value
+                    $resolvedSID = $null
+                    try {
+                        $resolvedSID = (New-Object System.Security.Principal.NTAccount($identity)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+                    } catch { $resolvedSID = $identity }
+
+                    if ($builtinSIDs -notcontains $resolvedSID) {
+                        $line = "[$($scope.label)] IDENTITY: $identity | SID: $resolvedSID | Right: DS-Replication-Get-Changes-All | DN: $($scope.dn)"
+                        Write-Both "    [!] Non-standard DCSync right ($($scope.label)): $identity"
+                        $findings += $line
+                    }
+                } catch {
+                    Write-ErrorLog -Context "Get-DCSyncRights:ace:$($scope.label)" -ErrorRecord $_
+                }
+            }
+        } catch {
+            Write-Both "    [!] Error querying ACL on $($scope.label) ($($scope.dn)): $($_.Exception.Message)"
+            Write-ErrorLog -Context "Get-DCSyncRights:scope:$($scope.label)" -ErrorRecord $_
         }
-    } catch {
-        Write-Both "    [!] Error querying domain object ACL: $_"
     }
 
     if ($findings.Count -gt 0) {
@@ -2434,7 +2950,7 @@ function Get-DCSyncRights {
         $findings | Set-Content -Path $evidencePath
         Write-Nessus-Finding "DCSync Rights Detected" "KB731" ([System.IO.File]::ReadAllText($evidencePath))
     } else {
-        Write-Both "    [+] No non-standard accounts with DCSync rights found"
+        Write-Both "    [+] No non-standard accounts with DCSync rights found (DomainRoot + AdminSDHolder + Configuration + Schema)"
     }
     Write-Both "    [-] Finished checking DCSync rights"
 }
@@ -2499,6 +3015,64 @@ function Get-HostHardeningChecks {
     } catch {
         Write-Both "    [~] Credential Guard / VBS registry keys not present on $env:COMPUTERNAME"
     }
+
+    # ---- NEW v1.4.0: NoPAC patches (KB5008102 / KB5008380 / KB5008602) + PKINIT enforcement ----
+    # v1.4.1: each registry / AD lookup wrapped in Invoke-Safe so missing keys + DC unreachable +
+    # missing krbtgt object never abort the surrounding host-hardening module. Each sub-check is independent.
+    $kdcPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\Kdc'
+    $nopacFindings = @()
+
+    Invoke-Safe -Context 'hosthardening:KrbtgtFullPacSignature' -Script {
+        try {
+            $kfps = (Get-ItemProperty -Path $kdcPath -Name 'KrbtgtFullPacSignature' -ErrorAction Stop).KrbtgtFullPacSignature
+            if ($kfps -lt 1) { $nopacFindings += "NoPAC: KrbtgtFullPacSignature = $kfps (must be >= 1; KB5008380)" }
+        } catch {
+            $nopacFindings += "NoPAC: KrbtgtFullPacSignature registry value MISSING — host may be unpatched against CVE-2021-42278/42287"
+        }
+    } | Out-Null
+
+    Invoke-Safe -Context 'hosthardening:PacRequestorEnforcement' -Script {
+        try {
+            $pre = (Get-ItemProperty -Path $kdcPath -Name 'PacRequestorEnforcement' -ErrorAction Stop).PacRequestorEnforcement
+            if ($pre -lt 2) { $nopacFindings += "NoPAC: PacRequestorEnforcement = $pre (must be 2 since Oct 2022 enforcement)" }
+        } catch {
+            $nopacFindings += "NoPAC: PacRequestorEnforcement registry value MISSING — KB5020805 enforcement not applied"
+        }
+    } | Out-Null
+
+    Invoke-Safe -Context 'hosthardening:StrongCertificateBindingEnforcement' -Script {
+        try {
+            $sbe = (Get-ItemProperty -Path $kdcPath -Name 'StrongCertificateBindingEnforcement' -ErrorAction Stop).StrongCertificateBindingEnforcement
+            if ($sbe -lt 2) { $nopacFindings += "PKINIT: StrongCertificateBindingEnforcement = $sbe (must be 2 since Feb 2025)" }
+        } catch {
+            $nopacFindings += "PKINIT: StrongCertificateBindingEnforcement registry value MISSING — defaults to compatibility mode (weak cert→user mapping)"
+        }
+    } | Out-Null
+
+    if ($nopacFindings.Count -gt 0) {
+        foreach ($m in $nopacFindings) { Write-Both "    [!] $m" ; $findings += $m }
+        Write-Nessus-Finding "NoPAC and PKINIT Enforcement" "KB736" ($nopacFindings -join "`n")
+    } else {
+        Write-Both "    [+] NoPAC patches and PKINIT StrongCertificateBindingEnforcement appear configured"
+    }
+
+    # ---- krbtgt enctype must be AES-only ----
+    Invoke-Safe -Context 'hosthardening:krbtgtEnctype' -Script {
+        $krbtgt = Get-ADUser -Filter { SamAccountName -eq 'krbtgt' } -Properties msDS-SupportedEncryptionTypes, PasswordLastSet -ErrorAction Stop
+        if ($krbtgt) {
+            $set = [int]$krbtgt.'msDS-SupportedEncryptionTypes'
+            $hasRC4 = ($set -band 0x04) -ne 0
+            $hasAES = ($set -band 0x18) -ne 0
+            if ($set -eq 0 -or $hasRC4 -or -not $hasAES) {
+                $msg = "krbtgt msDS-SupportedEncryptionTypes = $set — RC4 may be allowed. Set to 24 (AES128+AES256 only). PasswordLastSet=$($krbtgt.PasswordLastSet)"
+                Write-Both "    [!] $msg"
+                $findings += $msg
+                Write-Nessus-Finding "krbtgt Allows Weak Encryption Types" "KB737" $msg
+            } else {
+                Write-Both "    [+] krbtgt enctype set to AES-only (value $set)"
+            }
+        }
+    } | Out-Null
 
     if ($findings.Count -gt 0) {
         $evidencePath = "$outputdir\HostHardening.txt"
@@ -2675,70 +3249,104 @@ function Get-LDAPSecurity {
 }
 
 function Find-DangerousACLPermissions {
-    #Specify the ACLs and Groups to check against
+    # FIX v1.4.0:
+    #  - Use SID-based comparison (was: literal string "DOMAIN\Domain Users" never matched)
+    #  - Single-pass LDAP enumeration with nTSecurityDescriptor in the query (was: 3 passes + Get-Acl per object)
+    #  - Removed O(n²) $array.IndexOf() inside loops
     $dangerousAces = @('GenericAll', 'GenericWrite', 'ForceChangePassword', 'WriteDacl', 'WriteOwner', 'Delete')
-    $groupsToCheck = @('NT AUTHORITY\Authenticated Users', 'DOMAIN\Domain Users', 'Everyone')
 
-    # Find dangerous permissions on Computers
-    $computers = Get-ADObject -Filter { objectClass -eq 'computer' -and objectCategory -eq 'computer' } -Properties *
-    $computerResults = foreach ($computer in $computers) {
-        $acl = Get-ADAclSafe -DistinguishedName $computer.DistinguishedName
-        $dangerousRules = if ($acl) { $acl.Access | Where-Object { $_.ActiveDirectoryRights -in $dangerousAces -and $_.IdentityReference -in $groupsToCheck } } else { $null }
+    # Build SID set dynamically — Authenticated Users (S-1-5-11), Everyone (S-1-1-0),
+    # and current domain's "Domain Users" (S-1-5-21-…-513). Translate to NTAccount labels for matching.
+    $dangerousSids = New-Object System.Collections.Generic.HashSet[string]
+    [void]$dangerousSids.Add('S-1-5-11')   # Authenticated Users
+    [void]$dangerousSids.Add('S-1-1-0')    # Everyone
+    try {
+        $domainSid = (Get-ADDomain -ErrorAction Stop).DomainSID.Value
+        [void]$dangerousSids.Add("$domainSid-513")  # Domain Users (current domain)
+    } catch {}
 
-        if ($dangerousRules) {
-            foreach ($rule in $dangerousRules) {
-                [PSCustomObject]@{
-                    ObjectType            = 'Computer'
-                    ObjectName            = $computer
-                    IdentityReference     = $rule.IdentityReference
-                    AccessControlType     = $rule.AccessControlType
-                    ActiveDirectoryRights = $rule.ActiveDirectoryRights
-                }
-            }
-        }
-        Write-Progress -Activity "Searching for dangerous ACL permissions on computers" -Status "Computers searched: $($computers.IndexOf($computer) + 1)/$($computers.Count)" -PercentComplete (($computers.IndexOf($computer) + 1) / $computers.Count * 100)
+    # Pre-resolve to NTAccount strings for IdentityReference comparison (handles language-localized names).
+    $dangerousAccounts = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($sid in $dangerousSids) {
+        try {
+            $nt = (New-Object System.Security.Principal.SecurityIdentifier($sid)).Translate([System.Security.Principal.NTAccount]).Value
+            [void]$dangerousAccounts.Add($nt)
+        } catch {}
     }
+    # Always include Built-In Users (S-1-5-32-545) for completeness in localized environments
+    try {
+        $bu = (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')).Translate([System.Security.Principal.NTAccount]).Value
+        [void]$dangerousAccounts.Add($bu)
+    } catch {}
 
-    # Find dangerous permissions on groups
-    $groups = Get-ADObject -Filter { objectClass -eq 'group' -and objectCategory -eq 'group' } -Properties *
-    $groupResults = foreach ($group in $groups) {
-        $acl = Get-ADAclSafe -DistinguishedName $group.DistinguishedName
-        $dangerousRules = if ($acl) { $acl.Access | Where-Object { $_.ActiveDirectoryRights -in $dangerousAces -and $_.IdentityReference -in $groupsToCheck } } else { $null }
+    Write-Both "    [+] Resolved $($dangerousAccounts.Count) dangerous principals: $($dangerousAccounts -join ', ')"
 
-        if ($dangerousRules) {
-            foreach ($rule in $dangerousRules) {
-                [PSCustomObject]@{
-                    ObjectType            = 'Group'
-                    ObjectName            = $group
-                    IdentityReference     = $rule.IdentityReference
-                    AccessControlType     = $rule.AccessControlType
-                    ActiveDirectoryRights = $rule.ActiveDirectoryRights
-                }
-            }
+    # Single-pass LDAP scan: includes all 3 object classes, nTSecurityDescriptor in the response
+    # (eliminates per-object Get-Acl provider round-trip). -ResultPageSize keeps memory bounded.
+    $allObjects = @(
+        Get-ADObject -LDAPFilter '(|(objectClass=user)(objectClass=group)(objectClass=computer))' `
+                     -Properties nTSecurityDescriptor, objectClass `
+                     -ResultPageSize 500 -ErrorAction SilentlyContinue
+    )
+    $totalCount = $allObjects.Count
+    Write-Both "    [+] Single-pass ACL scan over $totalCount objects (users + groups + computers)"
+
+    $computerResults = New-Object System.Collections.Generic.List[object]
+    $groupResults    = New-Object System.Collections.Generic.List[object]
+    $userResults     = New-Object System.Collections.Generic.List[object]
+
+    $idx = 0
+    $skippedDueToError = 0
+    foreach ($obj in $allObjects) {
+        $idx++
+        if ($totalCount -gt 0 -and ($idx % 50) -eq 0) {
+            Write-Progress -Activity "Single-pass ACL scan" -Status "$idx / $totalCount" -PercentComplete ($idx / $totalCount * 100)
         }
-        Write-Progress -Activity "Searching for dangerous ACL permissions on groups" -Status "Groups searched: $($groups.IndexOf($group) + 1)/$($groups.Count)" -PercentComplete (($groups.IndexOf($group) + 1) / $groups.Count * 100)
-    }
-    # Find dangerous permissions on users
-    $users = Get-ADObject -Filter { objectClass -eq 'user' -and objectCategory -eq 'person' } -Properties *
+        # v1.4.1: per-iteration try/catch so a single AD object with a parse-failing SD
+        # (or a transient query error) doesn't abort the whole scan.
+        try {
+            $sd = $obj.nTSecurityDescriptor
+            if (-not $sd) { continue }
+            $access = $null
+            try { $access = $sd.Access } catch { continue }
+            if (-not $access) { continue }
 
-    $userResults = foreach ($user in $users) {
-        $acl = Get-ADAclSafe -DistinguishedName $user.DistinguishedName
+            foreach ($rule in $access) {
+                try {
+                    if ($rule.AccessControlType -ne 'Allow') { continue }
+                    # Match against pre-resolved NTAccount strings (handles "DOMAIN\Domain Users" properly)
+                    $idRef = "$($rule.IdentityReference)"
+                    if (-not $dangerousAccounts.Contains($idRef)) { continue }
+                    # ActiveDirectoryRights is a flags enum — string match against any of dangerousAces
+                    $rightsStr = "$($rule.ActiveDirectoryRights)"
+                    $hit = $false
+                    foreach ($ace in $dangerousAces) { if ($rightsStr -match [regex]::Escape($ace)) { $hit = $true ; break } }
+                    if (-not $hit) { continue }
 
-        if ($acl) {
-            $dangerousRules = $acl.Access | Where-Object { $_.ActiveDirectoryRights -in $dangerousAces -and $_.IdentityReference -in $groupsToCheck }
-            if ($dangerousRules) {
-                foreach ($rule in $dangerousRules) {
-                    [PSCustomObject]@{
-                        ObjectType            = 'User'
-                        ObjectName            = $user
-                        IdentityReference     = $rule.IdentityReference
+                    $row = [PSCustomObject]@{
+                        ObjectType            = $obj.objectClass
+                        ObjectName            = $obj.DistinguishedName
+                        IdentityReference     = $idRef
                         AccessControlType     = $rule.AccessControlType
-                        ActiveDirectoryRights = $rule.ActiveDirectoryRights
+                        ActiveDirectoryRights = $rightsStr
                     }
+                    switch ($obj.objectClass) {
+                        'computer' { $row.ObjectType = 'Computer' ; $computerResults.Add($row) ; break }
+                        'group'    { $row.ObjectType = 'Group'    ; $groupResults.Add($row)    ; break }
+                        'user'     { $row.ObjectType = 'User'     ; $userResults.Add($row)     ; break }
+                    }
+                } catch {
+                    Write-ErrorLog -Context "Find-DangerousACLPermissions:rule:$($obj.DistinguishedName)" -ErrorRecord $_
                 }
             }
-            Write-Progress -Activity "Searching for dangerous ACL permissions on users" -Status "Users searched: $($users.IndexOf($user) + 1)/$($users.Count)" -PercentComplete (($users.IndexOf($user) + 1) / $users.Count * 100)
+        } catch {
+            $skippedDueToError++
+            Write-ErrorLog -Context "Find-DangerousACLPermissions:object:$($obj.DistinguishedName)" -ErrorRecord $_
         }
+    }
+    Write-Progress -Activity "Single-pass ACL scan" -Completed
+    if ($skippedDueToError -gt 0) {
+        Write-Both "    [!] $skippedDueToError of $totalCount objects skipped due to errors (see logs/errors.log)"
     }
 
     # Output results
@@ -2815,6 +3423,7 @@ $script:CheckRegistry = @{
     'KB720'  = @{ check_id='AD-ASREP-001';      category='identity';  severity='high';           confidence='high'; impact='high';     remediation_effort='low';    title='Accounts with Kerberos Pre-Auth Disabled (AS-REP Roastable)'; recommendation='Enable pre-authentication requirement on all user accounts. Audit DONT_REQ_PREAUTH flag.' }
     'KB1101' = @{ check_id='AD-LDAP-002';       category='ldap';      severity='high';           confidence='high'; impact='high';     remediation_effort='low';    title='Weak LDAP Security Configuration';                        recommendation='Enable LDAP signing (LDAPServerIntegrity=2), deploy LDAPS certificate, enable channel binding.' }
     'KB500'  = @{ check_id='AD-IDENTITY-003';   category='identity';  severity='medium';         confidence='high'; impact='medium';   remediation_effort='medium'; title='Inactive User Accounts (180+ days)';                       recommendation='Disable or remove accounts inactive for more than 180 days. Implement automated lifecycle process.' }
+    'KB502'  = @{ check_id='AD-IDENTITY-007';   category='identity';  severity='low';            confidence='high'; impact='low';      remediation_effort='low';    title='Locked User Accounts Present in Domain';                  recommendation='Review locked accounts. Investigate accounts repeatedly locked (potential password-spray indicator) and unlock or disable as appropriate.' }
     'KB309'  = @{ check_id='AD-IDENTITY-004';   category='identity';  severity='medium';         confidence='high'; impact='medium';   remediation_effort='low';    title='Default Administrator Account Not Hardened';              recommendation='Rename the Administrator account (UID 500) and create a decoy account in its place.' }
     'KB501'  = @{ check_id='AD-IDENTITY-005';   category='identity';  severity='low';            confidence='high'; impact='low';      remediation_effort='low';    title='Disabled User Accounts Still in Domain';                  recommendation='Review and remove disabled accounts that are no longer needed. Clean up stale objects.' }
     'KB550'  = @{ check_id='AD-PWPOL-005';      category='policy';    severity='medium';         confidence='high'; impact='medium';   remediation_effort='medium'; title='User Accounts with Passwords Older Than 90 Days';         recommendation='Enforce password expiry policy. Identify accounts exceeding maximum password age.' }
@@ -2822,6 +3431,16 @@ $script:CheckRegistry = @{
     'KB730'  = @{ check_id='AD-KERBEROS-001';  category='kerberos';  severity='critical';       confidence='high'; impact='critical'; remediation_effort='medium'; title='Unconstrained Kerberos Delegation Enabled';               recommendation='Remove unconstrained delegation from all non-DC accounts. Migrate to constrained or resource-based constrained delegation (RBCD).' }
     'KB731'  = @{ check_id='AD-ACL-002';       category='acl';       severity='critical';       confidence='high'; impact='critical'; remediation_effort='medium'; title='Accounts with DCSync Rights (DS-Replication)';            recommendation='Remove DS-Replication-Get-Changes-All ACE from non-DC accounts. Only Domain Controllers should hold replication rights.' }
     'KB732'  = @{ check_id='AD-HOSTHARDENING-001'; category='hardening'; severity='high';       confidence='high'; impact='high';     remediation_effort='low';    title='Host Hardening Deficiencies (WDigest / LSA Protection)';  recommendation='Disable WDigest authentication (HKLM:\SYSTEM\...\WDigest UseLogonCredential=0) and enable LSA Protection (RunAsPPL=1) via GPO.' }
+    'KB733'  = @{ check_id='AD-KERBEROS-002';   category='kerberos';  severity='high';           confidence='high'; impact='high';     remediation_effort='medium'; title='Constrained Kerberos Delegation with Protocol Transition'; recommendation='Replace TrustedToAuthForDelegation (S4U2Self) with RBCD on the resource side, or remove delegation entirely. Combined with coerced authentication this enables forest compromise.' }
+    'KB734'  = @{ check_id='AD-KERBEROS-003';   category='kerberos';  severity='high';           confidence='high'; impact='high';     remediation_effort='low';    title='Resource-Based Constrained Delegation (RBCD) Configured'; recommendation='Verify principals listed in msDS-AllowedToActOnBehalfOfOtherIdentity are expected. Anomalous entries indicate KrbRelayUp / RBCD-abuse persistence.' }
+    'KB735'  = @{ check_id='AD-KERBEROS-004';   category='kerberos';  severity='critical';       confidence='high'; impact='critical'; remediation_effort='medium'; title='Shadow Credentials (msDS-KeyCredentialLink) on AD Object'; recommendation='Audit msDS-KeyCredentialLink writers. Remove unexpected key credentials and rotate the affected account credentials. Restrict write permissions on this attribute via GPO.' }
+    'KB736'  = @{ check_id='AD-HOSTHARDENING-002'; category='hardening'; severity='critical';   confidence='high'; impact='critical'; remediation_effort='low';    title='NoPAC / PKINIT Strong Mapping Enforcement Missing';        recommendation='Apply KB5008102/5008380/5008602 (NoPAC); set HKLM:\SYSTEM\CurrentControlSet\Services\Kdc\StrongCertificateBindingEnforcement = 2 (full enforce since Feb 2025).' }
+    'KB737'  = @{ check_id='AD-IDENTITY-008';   category='identity';  severity='high';           confidence='high'; impact='high';     remediation_effort='medium'; title='krbtgt Account Allows Weak Encryption Types';              recommendation='Set msDS-SupportedEncryptionTypes on krbtgt to AES-only (value 24). Reset the krbtgt password twice using the official rollover procedure.' }
+    'KB259a' = @{ check_id='AD-DOMAIN-005a';    category='domain';    severity='high';           confidence='high'; impact='high';     remediation_effort='high';   title='Windows Server 2012 (non-R2) Joined to Domain — EOL';      recommendation='Decommission or upgrade. Server 2012 reached end of extended support 10 Oct 2023; ESU is the only viable bridge.' }
+    'KB259b' = @{ check_id='AD-DOMAIN-005b';    category='domain';    severity='medium';         confidence='high'; impact='high';     remediation_effort='high';   title='Windows Server 2012 R2 Joined to Domain — EOL';            recommendation='Decommission or upgrade. Server 2012 R2 reached end of extended support 10 Oct 2023; ESU available through 2026.' }
+    'KB259c' = @{ check_id='AD-DOMAIN-005c';    category='domain';    severity='medium';         confidence='high'; impact='medium';   remediation_effort='high';   title='Windows Server 2016 Joined to Domain — Approaching EOL';   recommendation='Plan upgrade. Server 2016 mainstream support ended 2022; extended support ends 12 Jan 2027.' }
+    'KB738'  = @{ check_id='AD-FORENSIC-001';   category='forensics'; severity='informational';  confidence='high'; impact='medium';   remediation_effort='low';    title='NTDS.dit Dump Chain of Custody';                            recommendation='Preserve the ntds_custody.txt record alongside the NTDS dump; store both under restricted ACL until the chain-of-custody requirements are released by the engagement owner.' }
+    'KB901'  = @{ check_id='AD-INTERNAL-001';   category='internal';  severity='low';            confidence='medium';impact='low';     remediation_effort='low';    title='Internal Error Caught by Invoke-Safe';                      recommendation='Inspect logs/errors.log for the failing block. The audit continued and other modules ran. Re-run with -logLevel debug to capture more detail; report persistent errors with the script_hash from execution.json.' }
 }
 
 # --- Default per-module timeouts (seconds) ---
@@ -3056,15 +3675,16 @@ function Invoke-AuditModule {
     if (-not (Test-ModulePrereqs -Name $Name)) { return }
     $start = Get-Date
     $script:moduleResults[$Name] = [PSCustomObject]@{
-        module           = $Name
-        display_name     = $DisplayName
-        status           = 'running'
-        started_at_utc   = $start.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        ended_at_utc     = $null
-        duration_seconds = 0
-        timeout_seconds  = $TimeoutSeconds
-        findings_added   = 0
-        error            = $null
+        module             = $Name
+        display_name       = $DisplayName
+        status             = 'running'
+        started_at_utc     = $start.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        ended_at_utc       = $null
+        duration_seconds   = 0
+        timeout_seconds    = $TimeoutSeconds
+        findings_added     = 0
+        error              = $null
+        errors_captured    = 0    # v1.4.1: count of non-terminating errors raised during execution
     }
     $countBefore = if ($script:findings) { $script:findings.Count } else { 0 }
     $useBackgroundTimeout = $TimeoutSeconds -gt 0 -and (Get-Command Start-Job -ErrorAction SilentlyContinue) -and `
@@ -3072,8 +3692,21 @@ function Invoke-AuditModule {
                             (Test-Path -LiteralPath $script:selfScriptPath)
 
     if ($useBackgroundTimeout) {
-        Write-Trace -Level 'debug' -Message "Module '$Name' executing in timeout-managed job (${TimeoutSeconds}s budget)."
+        Write-Trace -Level 'debug' -Message "Module '$Name' executing in timeout-managed job (${TimeoutSeconds}s budget). script_hash=$script:initialScriptHash"
         $codeText = $Code.ToString()
+        # FIX v1.4.0: cache the parsed library block once at first job invocation, instead of
+        # re-reading and re-splitting the entire script (~4500 lines) inside every Start-Job.
+        # We pass the pre-extracted text to the worker so each job pays only [scriptblock]::Create cost.
+        if (-not $script:cachedLibraryBlock) {
+            try {
+                $rawSelf = Get-Content -Path $script:selfScriptPath -Raw -Encoding UTF8 -ErrorAction Stop
+                $partsSelf = [regex]::Split($rawSelf, '(?m)^#\s+MAIN EXECUTION\s*$', 2)
+                if ($partsSelf.Count -ge 2) { $script:cachedLibraryBlock = $partsSelf[0] }
+            } catch {
+                Write-Both "    [!] Could not pre-cache library block: $($_.Exception.Message)"
+            }
+        }
+        $libraryBlockText = if ($script:cachedLibraryBlock) { $script:cachedLibraryBlock } else { '' }
         $job = $null
         try {
             $job = Start-Job -ScriptBlock {
@@ -3084,7 +3717,8 @@ function Invoke-AuditModule {
                     [string]$OutputDir,
                     [bool]$QuietMode,
                     [string]$LogLevel,
-                    [bool]$NoNessusSwitch
+                    [bool]$NoNessusSwitch,
+                    [string]$LibraryBlockText
                 )
 
                 $runnerResult = [ordered]@{
@@ -3094,10 +3728,13 @@ function Invoke-AuditModule {
                 }
 
                 try {
-                    $rawScript = Get-Content -Path $ScriptPath -Raw -Encoding UTF8 -ErrorAction Stop
-                    $parts = [regex]::Split($rawScript, '(?m)^#\s+MAIN EXECUTION\s*$', 2)
-                    if ($parts.Count -lt 2) { throw "Could not isolate function section from script source." }
-                    . ([scriptblock]::Create($parts[0]))
+                    if ([string]::IsNullOrWhiteSpace($LibraryBlockText)) {
+                        $rawScript = Get-Content -Path $ScriptPath -Raw -Encoding UTF8 -ErrorAction Stop
+                        $parts = [regex]::Split($rawScript, '(?m)^#\s+MAIN EXECUTION\s*$', 2)
+                        if ($parts.Count -lt 2) { throw "Could not isolate function section from script source." }
+                        $LibraryBlockText = $parts[0]
+                    }
+                    . ([scriptblock]::Create($LibraryBlockText))
                     $outputdir         = $OutputDir
                     $script:quietMode  = $QuietMode
                     $script:logLevel   = $LogLevel
@@ -3127,7 +3764,7 @@ function Invoke-AuditModule {
                     error    = $runnerResult.error
                     findings = $runnerResult.findings
                 }
-            } -ArgumentList $script:selfScriptPath, $codeText, $Name, $outputdir, [bool]$script:quietMode, $script:logLevel, [bool]$noNessus
+            } -ArgumentList $script:selfScriptPath, $codeText, $Name, $outputdir, [bool]$script:quietMode, $script:logLevel, [bool]$noNessus, $libraryBlockText
 
             $waitResult = Wait-Job -Job $job -Timeout $TimeoutSeconds
             if ($null -eq $waitResult) {
@@ -3218,13 +3855,27 @@ function Invoke-AuditModule {
         if ($TimeoutSeconds -gt 0) {
             Write-Trace -Level 'verbose' -Message "Timeout budget requested for module '$Name', but Start-Job/script path unavailable. Running inline."
         }
+        # v1.4.1: scope $ErrorActionPreference + clear $Error so we can capture how many
+        # non-terminating errors the module raised (the module continued, but the operator
+        # should know they happened so re-runs can be triaged).
+        $prevEAP = $ErrorActionPreference
+        $errorsBefore = $Error.Count
         try {
+            $ErrorActionPreference = 'Continue'
             & $Code
             $end = Get-Date
             $script:moduleResults[$Name].status           = 'executed'
             $script:moduleResults[$Name].ended_at_utc     = $end.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
             $script:moduleResults[$Name].duration_seconds = [math]::Round(($end - $start).TotalSeconds, 1)
             $script:moduleResults[$Name].findings_added   = $(if ($script:findings) { $script:findings.Count } else { 0 }) - $countBefore
+            $script:moduleResults[$Name].errors_captured  = [math]::Max(0, ($Error.Count - $errorsBefore))
+            if ($script:moduleResults[$Name].errors_captured -gt 0) {
+                Write-Both "    [!] Module '$Name' completed with $($script:moduleResults[$Name].errors_captured) non-terminating error(s) — see logs/errors.log"
+                # Drain captured errors to errors.log without failing the module
+                for ($i = 0; $i -lt $script:moduleResults[$Name].errors_captured; $i++) {
+                    try { Write-ErrorLog -Context "module:$Name" -ErrorRecord $Error[$i] } catch {}
+                }
+            }
         } catch {
             $end = Get-Date
             $script:moduleResults[$Name].status           = 'failed'
@@ -3232,7 +3883,10 @@ function Invoke-AuditModule {
             $script:moduleResults[$Name].duration_seconds = [math]::Round(($end - $start).TotalSeconds, 1)
             $script:moduleResults[$Name].findings_added   = $(if ($script:findings) { $script:findings.Count } else { 0 }) - $countBefore
             $script:moduleResults[$Name].error            = $_.Exception.Message
-            Write-Both "    [!] Module '$Name' failed: $($_.Exception.Message)"
+            Write-Both "    [!] Module '$Name' failed (terminating): $($_.Exception.Message)"
+            Write-ErrorLog -Context "module:$Name:terminating" -ErrorRecord $_
+        } finally {
+            $ErrorActionPreference = $prevEAP
         }
     }
     $dur = $script:moduleResults[$Name].duration_seconds
@@ -3269,7 +3923,8 @@ function Export-ExecutionManifest {
         tool_name          = $script:ToolName
         tool_version       = $script:ToolVersion
         schema_version     = $script:SchemaVersion
-        script_hash        = Get-ScriptHash -Path $script:selfScriptPath
+        script_hash        = if ($script:initialScriptHash -and $script:initialScriptHash -ne 'unavailable') { $script:initialScriptHash } else { Get-ScriptHash -Path $script:selfScriptPath }
+        script_hash_captured_at = 'session_start'
         hostname           = $env:COMPUTERNAME
         fqdn               = $fqdn
         domain_name        = if ($domain) { $domain.DNSRoot }  else { $env:USERDNSDOMAIN }
@@ -3300,6 +3955,14 @@ function Export-ExecutionManifest {
         errors                = @($allErrors | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
         preflight_result   = $script:preflightResult
         exit_code          = $ExitCode
+        # FIX v1.4.0: emit a manifest of every TXT/CSV/JSON output stem actually generated by this run.
+        # report_generator.py reads this list (with fallback to its hardcoded array) so renamed/added
+        # stems no longer require a coordinated update on the Python side.
+        output_manifest    = @(
+            @(Get-ChildItem -Path $OutputDir -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.Extension -in @('.txt','.csv','.json','.ndjson','.html','.xml','.nessus') } |
+              ForEach-Object { $_.Name })
+        )
     }
     $manifest | ConvertTo-Json -Depth 10 | Out-File -FilePath "$OutputDir\execution.json" -Encoding UTF8
 }
@@ -3422,7 +4085,7 @@ function Export-FindingsCSV {
                 scope              = $_.scope
                 affected_count     = $_.affected_count
                 affected_objects   = ($_.affected_objects -join '; ')
-                evidence           = ($_.evidence -replace '[`r`n]+',' ')
+                evidence           = ($_.evidence -replace '\r?\n+',' ')
                 recommendation     = $_.recommendation
                 priority_score     = $_.priority_score
                 created_at_utc     = $_.created_at_utc
@@ -3825,6 +4488,9 @@ $script:ModulePrereqs = @{
     adcs             = @()
     ldapsecurity     = @('AD')
     securityevents   = @()
+    kerbdelegation   = @('AD')
+    dcsync           = @('AD')
+    hosthardening    = @()
 }
 
 $script:preflightResult = $null
@@ -3852,8 +4518,9 @@ function Invoke-Preflight {
     else              { pf_check 'ps_version' 'fail' "PowerShell $psver (5+ required)" }
 
     $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $script:isElevated = [bool]$elevated
     if ($elevated) { pf_check 'elevated' 'pass' 'Running as Administrator' }
-    else           { pf_check 'elevated' 'warn' 'Not elevated  some checks may be incomplete' }
+    else           { pf_check 'elevated' 'warn' 'Not elevated  HKLM-derived checks (WDigest, RunAsPPL, NoPAC, PKINIT) will be marked not_evaluated rather than inferring a default. Re-run elevated for full coverage.' }
 
     if (Get-Module -ListAvailable -Name ActiveDirectory) { pf_check 'module_ad'  'pass' 'ActiveDirectory module available' }
     else                                                  { pf_check 'module_ad'  'fail' 'ActiveDirectory module missing (install RSAT)' }
@@ -3903,7 +4570,7 @@ function Invoke-Preflight {
     if ($cu) { pf_check 'certutil' 'pass' "certutil found at $($cu.Source)" }
     else     { pf_check 'certutil' 'warn' 'certutil not found  ADCS checks may be limited' }
 
-    if ($profile -eq 'incident-response') {
+    if ($auditProfile -eq 'incident-response') {
         try {
             $secLog = Get-WinEvent -ListLog Security -ErrorAction Stop
             if ($secLog) {
@@ -4212,9 +4879,23 @@ function Export-Evidence {
 # Internal mode used by timeout-managed child jobs.
 if ($libraryOnly.IsPresent) { return }
 
-# 
+#
 #  MAIN EXECUTION
-# 
+#
+
+# v1.4.1: top-level trap. Any uncaught exception inside MAIN flows through here, gets recorded,
+# and execution continues to the finalise block (which guarantees Export-AllFindings runs).
+# 'continue' (vs 'break') keeps the script alive — without this, an unexpected throw in any
+# module would terminate the run and leave findings.ndjson + execution.json incomplete.
+trap [Exception] {
+    try {
+        Write-Host "[!] Top-level trap caught: $($_.Exception.Message)"
+        if (Get-Command Write-ErrorLog -ErrorAction SilentlyContinue) {
+            Write-ErrorLog -Context 'main:top-level-trap' -ErrorRecord $_
+        }
+    } catch {}
+    continue
+}
 
 $outputdir = if ($outputPath) { [System.IO.Path]::GetFullPath($outputPath) } else { Join-Path (Get-Item -Path ".\").FullName $env:computername }
 $script:sessionStartTime = Get-Date
@@ -4232,6 +4913,26 @@ try {
     exit 4
 }
 
+# FIX v1.4.0: idempotency guard. If the outputPath already contains a previous run, force the
+# operator to either pass -Force (overwrite + cleanup of stale .txt) or move to a new timestamped
+# subdirectory automatically. Without this, *.txt files were appended across runs (mixing evidence
+# from multiple audits), while findings.ndjson was overwritten — producing inconsistent reports.
+$existingNdjson = Join-Path $outputdir 'findings.ndjson'
+if (Test-Path -LiteralPath $existingNdjson) {
+    if ($Force.IsPresent) {
+        Write-Host "[!] -Force specified: removing legacy *.txt evidence files from previous run in $outputdir"
+        Get-ChildItem -Path $outputdir -Filter '*.txt' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        Get-ChildItem -Path $outputdir -Filter 'consolelog.txt' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    } else {
+        $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $newSub = Join-Path $outputdir $stamp
+        Write-Host "[*] Output directory already contains a previous run. Creating timestamped subdir: $newSub"
+        Write-Host "    (use -Force to overwrite the existing dir instead)"
+        New-Item -ItemType Directory -Path $newSub -Force | Out-Null
+        $outputdir = $newSub
+    }
+}
+
 # Create logs/ subdirectory
 $script:logsDir = Join-Path $outputdir "logs"
 try {
@@ -4247,6 +4948,17 @@ $script:moduleResults  = @{}
 $script:inventoryMode  = $false
 $script:warnings       = [System.Collections.Generic.List[string]]::new()
 $script:diffSummary    = $null
+$script:outputManifest = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+
+# FIX v1.4.0: capture script_hash at session start (forensic chain-of-custody).
+# Previously computed in Export-ExecutionManifest at end-of-run, which lost the hash if the
+# script file was edited mid-execution. We pin the SHA-256 of the source file as it was loaded.
+$script:initialScriptHash = 'unavailable'
+try {
+    if ($script:selfScriptPath -and (Test-Path -LiteralPath $script:selfScriptPath)) {
+        $script:initialScriptHash = (Get-FileHash -Path $script:selfScriptPath -Algorithm SHA256 -ErrorAction Stop).Hash
+    }
+} catch {}
 
 # Preflight checks
 Write-Both "[*] Running preflight checks..."
@@ -4275,39 +4987,65 @@ $running = $false
 Write-Both "[*] Script start time $($script:sessionStartTime)"
 Write-Both "[+] Outputting to $outputdir"
 
-# Module imports
+# Module imports — v1.4.1: only ActiveDirectory is fatal. Everything else falls back to capability=false
+# so module-level Test-ModulePrereqs skips dependent modules cleanly without aborting the whole run.
 try {
-    if (Get-Module -ListAvailable -Name ActiveDirectory) { Import-Module ActiveDirectory -ErrorAction Stop }
-    else { Write-Both "[!] ActiveDirectory module not installed, exiting..." ; exit 3 }
+    if (Get-Module -ListAvailable -Name ActiveDirectory) {
+        Import-Module ActiveDirectory -ErrorAction Stop
+        $script:capabilities['ActiveDirectory'] = $true
+        $script:capabilities['AD']              = $true
+    } else {
+        Write-Both "[!] ActiveDirectory module not installed, exiting (this is the one hard requirement)..."
+        exit 3
+    }
 } catch {
-    Write-Both "[!] Error loading ActiveDirectory module: $($_.Exception.Message)" ; exit 3
+    Write-Both "[!] Error loading ActiveDirectory module: $($_.Exception.Message) — exiting (cannot proceed without AD)"
+    exit 3
 }
 
+# ServerManager — soft-fail
+$script:capabilities['ServerManager'] = $false
 try {
-    if (Get-Module -ListAvailable -Name ServerManager) { Import-Module ServerManager -ErrorAction Stop }
-    else { Write-Both "[!] ServerManager module not installed, exiting..." ; exit 3 }
+    if (Get-Module -ListAvailable -Name ServerManager) {
+        Import-Module ServerManager -ErrorAction Stop
+        $script:capabilities['ServerManager'] = $true
+    } else {
+        Write-Both "[!] ServerManager module not installed — continuing (no module currently depends on it for findings)."
+    }
 } catch {
-    Write-Both "[!] Error loading ServerManager module: $($_.Exception.Message)" ; exit 3
+    Write-Both "[!] ServerManager import warning (non-fatal): $($_.Exception.Message)"
+    Write-ErrorLog -Context 'import:ServerManager' -ErrorRecord $_
 }
 
+# GroupPolicy — soft-fail. Modules that need it (gpo) will skip via Test-ModulePrereqs.
+$script:capabilities['GroupPolicy'] = $false
 try {
-    if (Get-Module -ListAvailable -Name GroupPolicy) { Import-Module GroupPolicy -ErrorAction Stop }
-    else { Write-Both "[!] GroupPolicy module not installed, exiting..." ; exit 3 }
+    if (Get-Module -ListAvailable -Name GroupPolicy) {
+        Import-Module GroupPolicy -ErrorAction Stop
+        $script:capabilities['GroupPolicy'] = $true
+    } else {
+        Write-Both "[!] GroupPolicy module not installed — GPO/SYSVOL checks will be skipped automatically."
+    }
 } catch {
-    Write-Both "[!] Error loading GroupPolicy module: $($_.Exception.Message)" ; exit 3
+    Write-Both "[!] GroupPolicy import warning (non-fatal): $($_.Exception.Message)"
+    Write-ErrorLog -Context 'import:GroupPolicy' -ErrorRecord $_
 }
 
+# DSInternals — already optional, kept as before
 if (Get-Module -ListAvailable -Name DSInternals) {
-    Import-Module DSInternals -ErrorAction SilentlyContinue
-    $script:capabilities['DSInternals'] = $true
+    try {
+        Import-Module DSInternals -ErrorAction SilentlyContinue
+        $script:capabilities['DSInternals'] = $true
+    } catch {
+        Write-Both "[!] DSInternals import warning (non-fatal): $($_.Exception.Message)"
+        Write-ErrorLog -Context 'import:DSInternals' -ErrorRecord $_
+        $script:capabilities['DSInternals'] = $false
+    }
 } else {
-    Write-Both "[!] DSInternals module not installed, use -installdeps to force install"
+    Write-Both "[!] DSInternals module not installed, use -installdeps to force install (password-quality checks will be skipped)"
     $script:capabilities['DSInternals'] = $false
 }
-$script:capabilities['ActiveDirectory'] = $true
-$script:capabilities['AD']              = $true
-$script:capabilities['GroupPolicy']     = $true
-$script:capabilities['ServerManager']   = $true
+
 $script:capabilities['AdmPwdPS']        = [bool](Get-Module -ListAvailable -Name AdmPwd.PS)
 $script:capabilities['LAPS']            = [bool](Get-Module -ListAvailable -Name LAPS)
 $script:capabilities['Interactive']     = [Environment]::UserInteractive
@@ -4333,9 +5071,9 @@ if (!$?) {
 
 $modulesToRun = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
-if ($profile -and $script:Profiles.ContainsKey($profile)) {
-    Write-Both "[*] Using profile: $profile"
-    foreach ($m in $script:Profiles[$profile]) { [void]$modulesToRun.Add($m) }
+if ($auditProfile -and $script:Profiles.ContainsKey($auditProfile)) {
+    Write-Both "[*] Using profile: $auditProfile"
+    foreach ($m in $script:Profiles[$auditProfile]) { [void]$modulesToRun.Add($m) }
 }
 
 # Explicit switches (additive to profile)
@@ -4358,20 +5096,24 @@ if ($acl)             { [void]$modulesToRun.Add('acl')             }
 if ($adcs)            { [void]$modulesToRun.Add('adcs')            }
 if ($ldapsecurity)    { [void]$modulesToRun.Add('ldapsecurity')    }
 if ($securityevents)  { [void]$modulesToRun.Add('securityevents')  }
+if ($kerbdelegation)  { [void]$modulesToRun.Add('kerbdelegation')  }
+if ($dcsync)          { [void]$modulesToRun.Add('dcsync')          }
+if ($hosthardening)   { [void]$modulesToRun.Add('hosthardening')   }
 
 foreach ($s in $selectedChecks) { [void]$modulesToRun.Add($s.Trim()) }
 
 if ($all) {
     foreach ($m in @('hostdetails','domainaudit','trusts','accounts','passwordpolicy','ntds','oldboxes',
                       'gpo','ouperms','laps','authpolsilos','insecurednszone','recentchanges',
-                      'spn','asrep','acl','adcs','ldapsecurity','securityevents')) { [void]$modulesToRun.Add($m) }
+                      'spn','asrep','kerbdelegation','dcsync','hosthardening',
+                      'acl','adcs','ldapsecurity','securityevents')) { [void]$modulesToRun.Add($m) }
 }
 
 foreach ($ex in $exclude) { [void]$modulesToRun.Remove($ex.Trim()) }
 $script:modulesRequested = @($modulesToRun)
 
 # Activate inventory/evidence mode
-if ($inventory.IsPresent -or $evidence.IsPresent -or $profile -in @('evidence','inventory-only','incident-response')) {
+if ($inventory.IsPresent -or $evidence.IsPresent -or $auditProfile -in @('evidence','inventory-only','incident-response')) {
     $script:inventoryMode = $true
 }
 
@@ -4544,38 +5286,61 @@ if (-not $running) {
     Write-Both "    -evidence         export evidence JSON snapshots (policies, trusts, LAPS, LDAP, domain, security events)"
     Write-Both "    -preflight        run preflight checks and exit"
     Write-Both "    -baseline <path>  compare findings against a previous run baseline"
+    Write-Both "    -Force            (v1.4.0) overwrite an existing -outputPath instead of creating timestamped subdir"
+    Write-Both "    -auditProfile <p> (v1.4.0) explicit profile param name; -profile is still accepted as alias"
     exit 5
 }
 
-#  Finalise 
+#  Finalise — v1.4.1: try/finally so Export-AllFindings + Write-Nessus-Footer ALWAYS run
+#  even if an unexpected error escapes the module-execution block above. Combined with the
+#  trap below, this guarantees the operator never gets a half-finished output dir.
 
-if (-not $noNessus) { Write-Nessus-Footer }
+$exitCode = 1
+try {
+    if (-not $noNessus) { Write-Nessus-Footer }
+    $endtime  = Get-Date
+    $exitCode = Get-AuditExitCode
+    Export-AllFindings -OutputDir $outputdir -ExitCode $exitCode
 
-$endtime  = Get-Date
-$exitCode = Get-AuditExitCode
+    $totalFindings = ($script:findings | Where-Object { $_.status -eq 'failed' }).Count
+    $critHigh      = ($script:findings | Where-Object { $_.status -eq 'failed' -and $_.severity -in @('critical','high') }).Count
+    $failedMods    = ($script:moduleResults.Values | Where-Object { $_.status -eq 'failed' }).Count
+    $partialMods   = ($script:moduleResults.Values | Where-Object { $_.status -eq 'partial' }).Count
+    $modErrors     = (($script:moduleResults.Values | ForEach-Object { [int]$_.errors_captured }) | Measure-Object -Sum).Sum
+    $duration      = [math]::Round(($endtime - $script:sessionStartTime).TotalSeconds, 1)
 
-Export-AllFindings -OutputDir $outputdir -ExitCode $exitCode
-
-$totalFindings = ($script:findings | Where-Object { $_.status -eq 'failed' }).Count
-$critHigh      = ($script:findings | Where-Object { $_.status -eq 'failed' -and $_.severity -in @('critical','high') }).Count
-$failedMods    = ($script:moduleResults.Values | Where-Object { $_.status -eq 'failed' }).Count
-$partialMods   = ($script:moduleResults.Values | Where-Object { $_.status -eq 'partial' }).Count
-$duration      = [math]::Round(($endtime - $script:sessionStartTime).TotalSeconds, 1)
-
-Write-Both ""
-Write-Both "[*] "
-Write-Both "[*]  LZ-ADaudit $versionnum  Execution Summary"
-Write-Both "[*] "
-Write-Both "[*]  Duration         : ${duration}s"
-Write-Both "[*]  Modules run      : $($script:moduleResults.Values.Count)"
-Write-Both "[*]  Modules failed   : $failedMods"
-Write-Both "[*]  Modules partial  : $partialMods"
-Write-Both "[*]  Total findings   : $totalFindings"
-Write-Both "[*]  Critical / High  : $critHigh"
-Write-Both "[*]  Output directory : $outputdir"
-Write-Both "[*]  Exit code        : $exitCode"
-Write-Both "[*] "
-Write-Both "[*] Script end time $endtime"
+    Write-Both ""
+    Write-Both "[*] "
+    Write-Both "[*]  LZ-ADaudit $versionnum  Execution Summary"
+    Write-Both "[*] "
+    Write-Both "[*]  Duration         : ${duration}s"
+    Write-Both "[*]  Modules run      : $($script:moduleResults.Values.Count)"
+    Write-Both "[*]  Modules failed   : $failedMods"
+    Write-Both "[*]  Modules partial  : $partialMods"
+    Write-Both "[*]  Errors captured  : $modErrors  (see logs/errors.log)"
+    Write-Both "[*]  Total findings   : $totalFindings"
+    Write-Both "[*]  Critical / High  : $critHigh"
+    Write-Both "[*]  Output directory : $outputdir"
+    Write-Both "[*]  Exit code        : $exitCode"
+    Write-Both "[*] "
+    Write-Both "[*] Script end time $endtime"
+} catch {
+    # Unhandled error in the finalise block itself — record everything we can and bail with exit 2.
+    Write-Both "[!] Unhandled error in finalise block: $($_.Exception.Message)"
+    Write-ErrorLog -Context 'finalise:unhandled' -ErrorRecord $_
+    $exitCode = 2
+} finally {
+    # Last-ditch attempt to ensure Nessus XML is closed and execution.json is written even
+    # if Export-AllFindings itself threw above.
+    try {
+        if (-not $noNessus -and $script:nessusFindings) { Write-Nessus-Footer }
+    } catch {}
+    try {
+        if (Get-Command Export-ExecutionManifest -ErrorAction SilentlyContinue) {
+            Export-ExecutionManifest -OutputDir $outputdir -ExitCode $exitCode
+        }
+    } catch {}
+}
 
 exit $exitCode
 

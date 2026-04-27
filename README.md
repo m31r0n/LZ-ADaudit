@@ -7,7 +7,7 @@
   ╚══════╝╚══════╝     ╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝   ╚═╝
 ```
 
-**Active Directory Security Assessment** | Lazarus Security Framework | `v1.3.0`
+**Active Directory Security Assessment** | Lazarus Security Framework | `v1.4.1`
 
 ---
 
@@ -174,6 +174,33 @@ Características del informe:
 -installdeps             # instala DSInternals si no está presente
 ```
 
+## Nuevos checks v1.4.0
+
+### RBCD, Constrained Delegation y Shadow Credentials (`-kerbdelegation`)
+El módulo ahora detecta también:
+- **Constrained Delegation con protocol transition** (`TrustedToAuthForDelegation = True`) — vector clásico S4U2Self con coerced auth (PetitPotam, etc.)
+- **RBCD anómalo** (`msDS-AllowedToActOnBehalfOfOtherIdentity` populado en cuentas no esperadas) — vector KrbRelayUp / abuse 2024-2025
+- **Shadow Credentials** (`msDS-KeyCredentialLink` populado en cuentas no administradas) — persistencia post-compromiso vía PKINIT
+
+### ADCS LDAP-native (ESC1-15, `-adcs`)
+Reescrito para leer plantillas vía `Get-ADObject` sobre `CN=Certificate Templates,...` (independiente del idioma del SO). Cobertura ampliada:
+- ESC1-4, ESC8 (existentes, mejorados)
+- **ESC9** (`CT_FLAG_NO_SECURITY_EXTENSION`)
+- **ESC10** (weak certificate mapping, CVE-2022-34691)
+- **ESC13** (OID group link abuse vía `msDS-OIDToGroupLink`)
+- **ESC14** (altSecID mapping abuse)
+- **ESC15 / EKUwu** (CVE-2024-49019, V1 templates con EKU client auth)
+
+### NoPAC, PKINIT enforcement, krbtgt enctype (`-hosthardening`)
+- Verifica patches NoPAC (KB5008102/5008380): `KrbtgtFullPacSignature`, `PacRequestorEnforcement`
+- Valida `StrongCertificateBindingEnforcement = 2` (PKINIT full enforce, febrero 2025)
+- Valida `krbtgt msDS-SupportedEncryptionTypes` AES-only
+
+### AdminSDHolder + Configuration NC (`-dcsync`)
+DCSync rights se auditan también en:
+- `CN=AdminSDHolder,CN=System,DC=...` (vector típico de persistencia)
+- `CN=Configuration,DC=...` (replicación particionada)
+
 ## Nuevos checks v1.3.0
 
 ### Unconstrained Kerberos Delegation (`-kerbdelegation`)
@@ -203,3 +230,5 @@ Esta herramienta genera evidencia sensible de Active Directory. Aplica las sigui
 |---|---|---|
 | v1.0.0 | 12/04/2026 | Release inicial — contrato de salida estable, perfiles, incident-response |
 | v1.3.0 | 13/04/2026 | kerbdelegation, dcsync, hosthardening — nuevos módulos y DB de remediación |
+| v1.4.0 | 27/04/2026 | Bug-fixes críticos (ACL filter, NTDS custody), ADCS LDAP-native (ESC9-15), RBCD/Constrained/ShadowCreds, NoPAC/PKINIT, performance (single-pass ACL, paginación, cacheo, CIM paralelo), idempotencia, $profile→$auditProfile, manifest de stems |
+| v1.4.1 | 27/04/2026 | Resiliencia para producción: ningún fallo individual aborta el run. Imports no-fatales (salvo AD), `Get-Variables` resiliente, helper `Invoke-Safe`, top-level trap, try/finally que garantiza ejecución de `Export-AllFindings`, try/catch per-iteration en módulos nuevos, `errors.log` dedicado, `errors_captured` en `execution.json` |

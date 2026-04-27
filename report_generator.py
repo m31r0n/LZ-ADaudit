@@ -155,23 +155,31 @@ def _load_ndjson(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     records: list[dict[str, Any]] = []
+    bad = 0
     for line in _read_text(path).splitlines():
         line = line.strip()
         if line:
             try:
                 records.append(json.loads(line))
             except json.JSONDecodeError:
-                pass
+                bad += 1
+    if bad:
+        # v1.4.0: surface malformed lines instead of silently dropping (was: bare `pass`)
+        print(f"  [warn] {path.name}: skipped {bad} malformed NDJSON line(s)", file=sys.stderr)
     return records
 
 
 def _load_csv(path: Path) -> list[dict[str, str]]:
     if not path.exists():
         return []
+    # v1.4.0: catch only specific exceptions and report them; previously a blanket
+    # `except Exception` swallowed everything, so a corrupt CSV silently produced
+    # an empty report.
     try:
         reader = csv.DictReader(_read_text(path).splitlines())
         return [dict(row) for row in reader]
-    except Exception:
+    except (csv.Error, UnicodeDecodeError, OSError) as e:
+        print(f"  [warn] {path.name}: failed to parse CSV ({type(e).__name__}: {e})", file=sys.stderr)
         return []
 
 
@@ -227,7 +235,17 @@ def load_audit_data(folder: Path) -> AuditData:
                 data.inventory[stem] = rows
 
         # --- Root TXT files ---
-        for stem in _TXT_STEMS:
+        # v1.4.0: prefer execution.json's output_manifest (authoritative list of stems
+        # the .ps1 actually generated). Fall back to the hardcoded _TXT_STEMS list for
+        # baselines produced by older versions of AdAudit.ps1.
+        manifest = data.execution.get("output_manifest", []) or []
+        manifest_txt_stems = sorted({
+            Path(name).stem for name in manifest
+            if isinstance(name, str) and name.lower().endswith(".txt")
+        })
+        # Union with the hardcoded list so we don't lose stems from older runs.
+        all_txt_stems = sorted(set(_TXT_STEMS) | set(manifest_txt_stems))
+        for stem in all_txt_stems:
             step(f"{stem}.txt")
             lines = _load_txt(folder / f"{stem}.txt")
             if lines:
@@ -368,10 +386,10 @@ _REMEDIATION_DB: dict[str, dict] = {
         ),
         "steps": [
             "Set domain-wide quota to 0 to block unauthorized domain joins:",
-            "  Set-ADDomain -Identity deoban.com -Replace @{'ms-DS-MachineAccountQuota'=0}",
+            "  Set-ADDomain -Identity <your-domain.tld> -Replace @{'ms-DS-MachineAccountQuota'=0}",
             "Delegate domain join rights to a specific IT group only:",
             "  Create OU 'Staging Computers', delegate 'Create/Delete Computer Objects' to IT Helpdesk group",
-            "  Set-ADObject -Identity 'OU=Staging,DC=deoban,DC=com' -Add @{nTSecurityDescriptor=...} (use AD delegation wizard)",
+            "  Set-ADObject -Identity 'OU=Staging,DC=<your-domain>,DC=tld' -Add @{nTSecurityDescriptor=...} (use AD delegation wizard)",
             "Document which accounts are authorized to join workstations.",
             "Verify change: Get-ADDomain | Select -ExpandProperty AllowedDNSSuffixes; (Get-ADDomain).ms-DS-MachineAccountQuota",
         ],
@@ -418,7 +436,7 @@ _REMEDIATION_DB: dict[str, dict] = {
         ),
         "steps": [
             "Enroll all Tier 0 and Tier 1 admin accounts in Protected Users group:",
-            "  Add-ADGroupMember -Identity 'Protected Users' -Members abejarano_admin,deobanadmin,...",
+            "  Add-ADGroupMember -Identity 'Protected Users' -Members <admin-account-1>,<admin-account-2>,...",
             "Verify DFL supports Protected Users (requires Windows Server 2012 R2+ domain functional level).",
             "Test in staging first — Protected Users cannot use NTLM; verify all admin tools support Kerberos.",
             "Monitor for authentication failures after enrollment using Event IDs 4625 / 4771.",
@@ -443,7 +461,7 @@ _REMEDIATION_DB: dict[str, dict] = {
             "Disable (do not delete immediately) all inactive accounts:",
             "  Disable-ADAccount -Identity <account>",
             "Move disabled accounts to a quarantine OU with restricted GPO:",
-            "  Move-ADObject -Identity <DN> -TargetPath 'OU=Disabled,DC=deoban,DC=com'",
+            "  Move-ADObject -Identity <DN> -TargetPath 'OU=Disabled,DC=<your-domain>,DC=tld'",
             "After 90 days in quarantine with no business justification, delete the account.",
             "Implement an automated quarterly review process (script + HR integration).",
         ],
@@ -567,16 +585,16 @@ _REMEDIATION_DB: dict[str, dict] = {
         "steps": [
             "Deploy Windows LAPS (built-in since Windows Server 2019 / Windows 11 22H2):",
             "  Update-LapsADSchema  # extend AD schema (run once, Schema Admin required)",
-            "  Set-LapsADComputerSelfPermission -Identity 'OU=Workers_computers,DC=deoban,DC=com'",
+            "  Set-LapsADComputerSelfPermission -Identity 'OU=<workstations-OU>,DC=<your-domain>,DC=tld'",
             "Configure Windows LAPS via GPO:",
             "  Computer Config > Administrative Templates > System > LAPS:",
             "  'Configure password backup directory' = Active Directory",
             "  'Password settings': Length=20, Complexity=LargeLettersSmallLettersNumbersSpecials, Age=30 days",
             "  'Post-authentication actions': Reset password after managed account use",
             "Grant read permissions to LAPS passwords to specific admin groups only:",
-            "  Set-LapsADReadPasswordPermission -Identity 'OU=Workers_computers,...' -AllowedPrincipals 'DEOBAN\\IT_LAPS_Readers'",
-            "Verify LAPS deployment: Get-LapsADPassword -Identity JAPALACIOSW11 -AsPlainText",
-            "Computers needing LAPS immediately: JAPALACIOSW11, JJVERAW11, WIN-DC-1",
+            "  Set-LapsADReadPasswordPermission -Identity 'OU=<workstations-OU>,...' -AllowedPrincipals '<DOMAIN>\\IT_LAPS_Readers'",
+            "Verify LAPS deployment: Get-LapsADPassword -Identity <computer-name> -AsPlainText",
+            "Apply to all computers in scope; review the 'Computers Without LAPS' table in the audit output for the prioritised list.",
         ],
         "references": [
             "MS Docs: Windows LAPS overview",
@@ -630,7 +648,7 @@ _REMEDIATION_DB: dict[str, dict] = {
             "  Set-ADUser <sam> -PasswordNeverExpires $false",
             "For service accounts: evaluate migration to Group Managed Service Accounts (gMSA):",
             "  # gMSAs rotate passwords automatically (240-char, machine-managed)",
-            "  New-ADServiceAccount -Name 'svc-bindldap' -DNSHostName 'WIN-DC-1.deoban.com' -PrincipalsAllowedToRetrieveManagedPassword 'bind_servers_group'",
+            "  New-ADServiceAccount -Name 'svc-bindldap' -DNSHostName '<dc-fqdn>' -PrincipalsAllowedToRetrieveManagedPassword 'bind_servers_group'",
             "For bind accounts that cannot use gMSA: document exception, set a rotation schedule (90 days), store in a PAM vault.",
             "Remove PasswordNeverExpires from all accounts not formally documented as exceptions.",
         ],
@@ -2215,6 +2233,10 @@ def build_html(data: AuditData) -> str:
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
+  <!-- v1.4.0: defense-in-depth CSP. The report inlines all CSS/JS, so 'unsafe-inline' is required;
+       no external scripts/images/fonts. Blocks any unintended XSS vector via injected evidence text. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none';">
+  <meta name="referrer" content="no-referrer">
   <title>ADaudit — {_h(hostname)}</title>
   <style>{_CSS}</style>
 </head>
@@ -2263,8 +2285,20 @@ def build_xlsx(data: AuditData, path: Path) -> None:
     # Light zebra stripe — avoids the dark-background/black-text readability issue
     ALT_FILL = PatternFill("solid", fgColor="EEF2FF")
 
+    # v1.4.0: Excel limits sheet names to 31 chars and they must be unique. Truncating with [:31]
+    # without checking for collision crashes openpyxl. _ws() now disambiguates.
+    _used_sheet_names: set[str] = set()
+
     def _ws(name: str) -> "openpyxl.worksheet.worksheet.Worksheet":
-        ws = wb.create_sheet(name)
+        base = (name or "Sheet")[:31]
+        candidate = base
+        idx = 2
+        while candidate in _used_sheet_names:
+            suffix = f"_{idx}"
+            candidate = (base[: 31 - len(suffix)] + suffix)
+            idx += 1
+        _used_sheet_names.add(candidate)
+        ws = wb.create_sheet(candidate)
         ws.sheet_view.showGridLines = False
         return ws
 
@@ -2676,7 +2710,7 @@ def _parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   python report_generator.py                              # auto-detect folder
-  python report_generator.py C:\\Audit\\WIN-DC-1_...      # explicit folder
+  python report_generator.py C:\\Audit\\<DC>_<timestamp>  # explicit folder
   python report_generator.py . -f html                   # HTML only
   python report_generator.py . -f xlsx                   # XLSX only
   python report_generator.py . -o myreport --open        # custom name + open
@@ -2718,11 +2752,24 @@ def main() -> None:
     html_path = folder / f"{base_name}.html"
     xlsx_path = folder / f"{base_name}.xlsx"
 
+    # v1.4.0: refuse silently degrading from "both" → HTML when openpyxl is missing.
+    # If the user explicitly asked for XLSX (or both) and openpyxl is unavailable, exit non-zero.
+    if args.format in ("xlsx", "both") and not _XLSX_OK:
+        print(
+            "[ERROR] openpyxl is required for XLSX output but is not installed.\n"
+            "        Install with: pip install openpyxl\n"
+            "        Or run with -f html to generate only the HTML report.",
+            file=sys.stderr,
+        )
+        if args.format == "xlsx":
+            sys.exit(2)
+        # For -f both, the user gets a warning and HTML still proceeds, but exit code is 2.
+
     print(f"\n  Folder : {folder}")
     if args.format in ("html", "both"):
         print(f"  HTML   : {html_path.name}")
     if args.format in ("xlsx", "both"):
-        print(f"  XLSX   : {xlsx_path.name}")
+        print(f"  XLSX   : {xlsx_path.name}{'  [SKIPPED — openpyxl missing]' if not _XLSX_OK else ''}")
     print()
 
     # --- Load ---
@@ -2751,6 +2798,11 @@ def main() -> None:
 
     if args.open and args.format in ("html", "both"):
         webbrowser.open(html_path.as_uri())
+
+    # If user asked for XLSX (alone or via "both") and openpyxl was missing, exit non-zero so
+    # CI / scheduled jobs notice the partial result.
+    if args.format in ("xlsx", "both") and not _XLSX_OK:
+        sys.exit(2)
 
 
 if __name__ == "__main__":
