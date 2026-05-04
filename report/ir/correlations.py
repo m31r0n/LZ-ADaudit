@@ -234,13 +234,5 @@ def run_correlations(data) -> list[dict]:
         })
 
     return out
-                "Mimikatz. Combinado con cualquier ejecucion arbitraria en el "
-                "DC, equivale a compromiso de dominio inmediato."
-            ),
-            "mitre": ["T1003.001"],
-            "evidence": " | ".join(
-                ln for ln in hh if "WDigest" in ln or "RunAsPPL" in ln
-            ),
-        })
 
     return out

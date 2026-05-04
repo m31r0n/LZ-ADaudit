@@ -266,14 +266,15 @@ def _compute_kpis(data, category_scores) -> dict[str, Any]:
 
 def persist_history(folder: Path, posture: PostureReport) -> None:
     """Append the current posture to ``posture_history.json`` in *folder*."""
+    from .data import read_text  # BOM-tolerant
     hp = folder / "posture_history.json"
     history: list[dict] = []
     if hp.exists():
         try:
-            history = json.loads(hp.read_text(encoding="utf-8"))
+            history = json.loads(read_text(hp))
             if not isinstance(history, list):
                 history = []
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             history = []
     history.append(posture.asdict())
     # Keep last 24 entries (2 years of monthly runs)
@@ -286,11 +287,12 @@ def persist_history(folder: Path, posture: PostureReport) -> None:
 
 
 def load_history(folder: Path) -> list[dict]:
+    from .data import read_text  # BOM-tolerant
     hp = folder / "posture_history.json"
     if not hp.exists():
         return []
     try:
-        history = json.loads(hp.read_text(encoding="utf-8"))
+        history = json.loads(read_text(hp))
         return history if isinstance(history, list) else []
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return []

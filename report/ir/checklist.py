@@ -19,7 +19,14 @@ def _add(items: list[dict], section: str, name: str, state: str,
 
 
 def build_ir_indicators(data) -> list[dict]:
-    """Build the post-ransomware verification checklist."""
+    """Build the post-ransomware verification checklist.
+
+    Returns an empty list when IR mode is not active — preventing
+    'POST-INCIDENT' / 'PRE-INCIDENT' labels from appearing on baseline
+    runs where no incident date was supplied.
+    """
+    if not getattr(data, "incident", None) or not data.incident.active:
+        return []
     items: list[dict] = []
     dom = data.evidence.get("domain", {}) or {}
     hh = _txt(data, "HostHardening")

@@ -52,7 +52,9 @@ def derive_execution_from_files(folder: Path,
                                 preflight: dict) -> dict[str, Any]:
     """Reconstruct minimal execution metadata when execution.json is missing."""
     ex: dict[str, Any] = {"_derived": True}
-    fallback_host = (folder.name.split("_", 2)[-1]
+    # Folder convention: <DC>_<YYYYMMDD>_<HHMMSS> — first segment is the DC name.
+    # Previous code used [-1] which returned the timestamp instead of the host.
+    fallback_host = (folder.name.split("_", 1)[0]
                      if "_" in folder.name else folder.name)
     ex["hostname"] = (preflight.get("hostname")
                       or (evidence.get("domain", {}) or {}).get("hostname")

@@ -16,7 +16,7 @@ from ...remediation import (
     timeline_badge as _timeline_badge,
     remediation_context as _remediation_context,
 )
-from ..charts_proxy import _svg_donut, _svg_hbar
+from ..charts import svg_donut as _svg_donut, svg_hbar as _svg_hbar
 
 
 def _section_inventory(data: AuditData) -> str:

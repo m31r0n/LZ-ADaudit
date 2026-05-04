@@ -7,7 +7,12 @@
   ╚══════╝╚══════╝     ╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝   ╚═╝
 ```
 
-**Active Directory Security Assessment** | Lazarus Security Framework | `v1.4.1`
+**Active Directory Security Assessment** | Lazarus Security Framework
+
+| Componente | Versión |
+|---|---|
+| `AdAudit.ps1` | `v1.4.1` |
+| `report` (Python package) | `v1.6.0` |
 
 ---
 

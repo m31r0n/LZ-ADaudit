@@ -473,7 +473,7 @@ Function Get-DNSZoneInsecure {
         $totalcount = ($insecurezones | Measure-Object | Select-Object Count).count
         if ($totalcount -gt 0) {
             foreach ($insecurezone in $insecurezones ) {
-                Add-Content -Path "$outputdir\insecure_dns_zones.txt" -Value "The DNS Zone $($insecurezone.ZoneName) allows insecure updates ($($insecurezone.DynamicUpdate))"
+                Add-Content -Path "$outputdir\insecure_dns_zones.txt" -Value "The DNS Zone $($insecurezone.ZoneName) allows insecure updates ($($insecurezone.DynamicUpdate))" -Encoding UTF8
             }
             Write-Both "    [!] There were $totalcount DNS zones configured to allow insecure updates (KB842)"
             Write-Nessus-Finding "InsecureDNSZone" "KB842" ([System.IO.File]::ReadAllText("$outputdir\insecure_dns_zones.txt"))
@@ -522,8 +522,8 @@ Function Get-OUPerms {
         } catch { $output = $null }
         if ($output -ne $null) {
             $count++
-            Add-Content -Path "$outputdir\ou_permissions.txt" -Value "OU: $object"
-            Add-Content -Path "$outputdir\ou_permissions.txt" -Value "[!] Rights: $($output.IdentityReference) $($output.ActiveDirectoryRights) $($output.AccessControlType)"
+            Add-Content -Path "$outputdir\ou_permissions.txt" -Value "OU: $object" -Encoding UTF8
+            Add-Content -Path "$outputdir\ou_permissions.txt" -Value "[!] Rights: $($output.IdentityReference) $($output.ActiveDirectoryRights) $($output.AccessControlType)" -Encoding UTF8
         }
     }
     Write-Progress -Activity "Searching for non standard permissions for authenticated users..." -Status "Ready" -Completed
@@ -630,7 +630,7 @@ function Get-LAPSStatus {
                              Where-Object { -not $_.'ms-Mcs-AdmPwd' } |
                              Select-Object -ExpandProperty Name
             if ($legacyMissing) {
-                $legacyMissing | Set-Content -Path $missingLegacyFile
+                $legacyMissing | Set-Content -Path $missingLegacyFile -Encoding UTF8
                 Write-Both  "    [!] Some computers/servers don't have a LEGACY LAPS password set, see $missingLegacyFile"
                 Write-Nessus-Finding "LAPSMissingorExpired" "KB258" ([System.IO.File]::ReadAllText($missingLegacyFile))
             }
@@ -650,7 +650,7 @@ function Get-LAPSStatus {
                 }
             }
             if ($legacyExpired) {
-                $legacyExpired | Set-Content -Path $legacyExpiredFile
+                $legacyExpired | Set-Content -Path $legacyExpiredFile -Encoding UTF8
                 Write-Both  "    [!] Some computers/servers have LEGACY LAPS password expired, see $legacyExpiredFile"
                 Write-Nessus-Finding "LAPSMissingorExpired" "KB258" ([System.IO.File]::ReadAllText($legacyExpiredFile))
             }
@@ -668,7 +668,7 @@ function Get-LAPSStatus {
                     foreach ($holder in $res.ExtendedRightHolders) {
                         if ($systemPrincipals -notcontains $holder) {
                             "$holder can read LEGACY LAPS password attribute in $($ou.DistinguishedName)" |
-                                Add-Content -Path $legacyRightsFile
+                                Add-Content -Path $legacyRightsFile -Encoding UTF8
                         }
                     }
                 } catch { continue }
@@ -722,14 +722,14 @@ function Get-LAPSStatus {
         if ($dcMissingDSRM) { $aggregateMissing += $dcMissingDSRM }
 
         if ($aggregateMissing) {
-            $aggregateMissing | Set-Content -Path $winMissingFile
+            $aggregateMissing | Set-Content -Path $winMissingFile -Encoding UTF8
             Write-Both  "    [!] Some computers/servers don't have a WINDOWS LAPS password backed up (or DSRM on DCs where supported), see $winMissingFile"
             Write-Nessus-Finding "WindowsLAPSMissingOrNotBackedUp" "KB258" ([System.IO.File]::ReadAllText($winMissingFile))
         }
 
         # Write DC-specific missing file if applicable
         if ($dcMissingDSRM) {
-            $dcMissingDSRM | Set-Content -Path $dcMissingDSRMFile
+            $dcMissingDSRM | Set-Content -Path $dcMissingDSRMFile -Encoding UTF8
             Write-Both  "    [!] Domain Controllers missing DSRM backup via Windows LAPS: see $dcMissingDSRMFile"
             Write-Nessus-Finding "WindowsLAPSDSRMissing" "KB258" ([System.IO.File]::ReadAllText($dcMissingDSRMFile))
         }
@@ -766,14 +766,14 @@ function Get-LAPSStatus {
         if ($dcExpiredDSRMLines) { $aggregateExpired += $dcExpiredDSRMLines }
 
         if ($aggregateExpired) {
-            $aggregateExpired | Set-Content -Path $winExpiredFile
+            $aggregateExpired | Set-Content -Path $winExpiredFile -Encoding UTF8
             Write-Both  "    [!] Some computers/servers have WINDOWS LAPS password expired (or DSRM on DCs), see $winExpiredFile"
             Write-Nessus-Finding "WindowsLAPSMissingOrExpired" "KB258" ([System.IO.File]::ReadAllText($winExpiredFile))
         }
 
         # DC-specific expired DSRM file
         if ($dcExpiredDSRMLines) {
-            $dcExpiredDSRMLines | Set-Content -Path $dcExpiredDSRMFile
+            $dcExpiredDSRMLines | Set-Content -Path $dcExpiredDSRMFile -Encoding UTF8
             Write-Both  "    [!] Domain Controllers with EXPIRED DSRM secret: see $dcExpiredDSRMFile"
             Write-Nessus-Finding "WindowsLAPSDSRMExpired" "KB258" ([System.IO.File]::ReadAllText($dcExpiredDSRMFile))
         }
@@ -806,7 +806,7 @@ function Get-LAPSStatus {
                         foreach ($holder in $result.ExtendedRightHolders) {
                             if ($systemPrincipals -notcontains $holder) {
                                 "$holder can read WINDOWS LAPS password info in $($ou.DistinguishedName)" |
-                                    Add-Content -Path $winRightsFile
+                                    Add-Content -Path $winRightsFile -Encoding UTF8
                             }
                         }
                     }
@@ -857,7 +857,7 @@ Function Get-PrivilegedGroupAccounts {
     foreach ($account in $privusersunique) {
         if ($totalcount -eq 0) { break }
         Write-Progress -Activity "Searching for users who are in privileged groups..." -Status "Currently identifed $count" -PercentComplete ($count / $totalcount * 100)
-        Add-Content -Path "$outputdir\accounts_userPrivileged.txt" -Value "$($account.SamAccountName) ($($account.Name))"
+        Add-Content -Path "$outputdir\accounts_userPrivileged.txt" -Value "$($account.SamAccountName) ($($account.Name))" -Encoding UTF8
         $count++
     }
     Write-Progress -Activity "Searching for users who are in privileged groups..." -Status "Ready" -Completed
@@ -881,7 +881,7 @@ Function Get-ProtectedUsers {
             if ($totalcount -eq 0) { break }
             Write-Progress -Activity "Searching for protected users..." -Status "Currently identifed $count" -PercentComplete ($count / $totalcount * 100)
             $account = Get-ADObject $members -Properties SamAccountName
-            Add-Content -Path "$outputdir\accounts_protectedusers.txt" -Value "$($account.SamAccountName) ($($account.Name))"
+            Add-Content -Path "$outputdir\accounts_protectedusers.txt" -Value "$($account.SamAccountName) ($($account.Name))" -Encoding UTF8
             $count++
         }
         Write-Progress -Activity "Searching for protected users..." -Status "Ready" -Completed
@@ -1089,7 +1089,7 @@ Function Get-UserPasswordNotChangedRecently {
         else {
             $datelastchanged = "Never"
         }
-        Add-Content -Path "$outputdir\accounts_with_old_passwords.txt" -Value "User $($account.SamAccountName) ($($account.Name)) has not changed their password since $datelastchanged"
+        Add-Content -Path "$outputdir\accounts_with_old_passwords.txt" -Value "User $($account.SamAccountName) ($($account.Name)) has not changed their password since $datelastchanged" -Encoding UTF8
         $count++
     }
     Write-Progress -Activity "Searching for passwords older than 90days..." -Status "Ready" -Completed
@@ -1131,7 +1131,7 @@ Function Get-GPOsPerOU {
         if ($totalcount -eq 0) { break }
         Write-Progress -Activity "Identifying which GPOs apply to which OUs..." -Status "Currently identifed $count OUs" -PercentComplete ($count / $totalcount * 100)
         $combinedgpos = ($(((Get-GPInheritance -Target $ouobject).InheritedGpoLinks) | select DisplayName) | ForEach-Object { $_.DisplayName }) -join ','
-        Add-Content -Path "$outputdir\ous_inheritedGPOs.txt" -Value "$($ouobject.Name) Inherits these GPOs: $combinedgpos"
+        Add-Content -Path "$outputdir\ous_inheritedGPOs.txt" -Value "$($ouobject.Name) Inherits these GPOs: $combinedgpos" -Encoding UTF8
         $count++
     }
     Write-Progress -Activity "Identifying which GPOs apply to which OUs..." -Status "Ready" -Completed
@@ -1281,7 +1281,7 @@ Function Get-InactiveAccounts {
             else {
                 $userlastused = "Never"
             }
-            Add-Content -Path "$outputdir\accounts_inactive.txt" -Value "User $($account.SamAccountName) ($($account.Name)) has not logged on since $userlastused"
+            Add-Content -Path "$outputdir\accounts_inactive.txt" -Value "User $($account.SamAccountName) ($($account.Name)) has not logged on since $userlastused" -Encoding UTF8
             $count++
         }
     }
@@ -1324,7 +1324,7 @@ Function Get-DisabledAccounts {
     foreach ($account in $disabledaccounts) {
         if ($totalcount -eq 0) { break }
         Write-Progress -Activity "Searching for disabled users..." -Status "Currently identifed $count" -PercentComplete ($count / $totalcount * 100)
-        Add-Content -Path "$outputdir\accounts_disabled.txt" -Value "Account $($account.SamAccountName) ($($account.Name)) is disabled"
+        Add-Content -Path "$outputdir\accounts_disabled.txt" -Value "Account $($account.SamAccountName) ($($account.Name)) is disabled" -Encoding UTF8
         $count++
     }
     Write-Progress -Activity "Searching for disabled users..." -Status "Ready" -Completed
@@ -1335,13 +1335,14 @@ Function Get-DisabledAccounts {
 }
 Function Get-LockedAccounts {
     #Lists locked accounts
-    $lockedAccounts = Get-ADUser -Filter * -Properties LockedOut | Where-Object { $_.LockedOut -eq $true }
+    # Server-side filter: avoid downloading every user just to filter client-side
+    $lockedAccounts = Search-ADAccount -LockedOut -UsersOnly
     $count = 0
     $totalcount = ($lockedAccounts | Measure-Object | Select-Object Count).Count
     foreach ($account in $lockedAccounts) {
         if ($totalcount -eq 0) { break }
         Write-Progress -Activity "Searching for locked users..." -Status "Currently identifed $count" -PercentComplete ($count / $totalcount * 100)
-        Add-Content -Path "$outputdir\accounts_locked.txt" -Value "Account $($account.SamAccountName) ($($account.Name)) is locked"
+        Add-Content -Path "$outputdir\accounts_locked.txt" -Value "Account $($account.SamAccountName) ($($account.Name)) is locked" -Encoding UTF8
         $count++
     }
     Write-Progress -Activity "Searching for locked users..." -Status "Ready" -Completed
@@ -1358,7 +1359,7 @@ Function Get-AccountPassDontExpire {
     foreach ($account in $nonexpiringpasswords) {
         if ($totalcount -eq 0) { break }
         Write-Progress -Activity "Searching for users with passwords that dont expire..." -Status "Currently identifed $count" -PercentComplete ($count / $totalcount * 100)
-        Add-Content -Path "$outputdir\accounts_passdontexpire.txt" -Value "$($account.SamAccountName) ($($account.Name))"
+        Add-Content -Path "$outputdir\accounts_passdontexpire.txt" -Value "$($account.SamAccountName) ($($account.Name))" -Encoding UTF8
         $count++
     }
     Write-Progress -Activity "Searching for users with passwords that dont expire..." -Status "Ready" -Completed
@@ -1395,7 +1396,7 @@ Function Get-OldBoxes {
         foreach ($m in $bucket) {
             $i++
             Write-Progress -Activity $progressLabel -Status "$i / $($bucket.Count)" -PercentComplete ($i / $bucket.Count * 100)
-            Add-Content -Path $file -Value "$($m.Name), $($m.OperatingSystem), $($m.OperatingSystemServicePack), $($m.OperatingSystemVersion), $($m.IPv4Address)"
+            Add-Content -Path $file -Value "$($m.Name), $($m.OperatingSystem), $($m.OperatingSystemServicePack), $($m.OperatingSystemVersion), $($m.IPv4Address)" -Encoding UTF8
         }
         Write-Progress -Activity $progressLabel -Status 'Ready' -Completed
         Write-Both "    [!] $($bucket.Count) machines: $label (see $(Split-Path $file -Leaf))  ($kbId)"
@@ -1411,7 +1412,7 @@ Function Get-OldBoxes {
     $aggregate = $legacyOld + $srv2012 + $srv2012R2 + $srv2016
     if ($aggregate.Count -gt 0) {
         $rows = foreach ($m in $aggregate) { "$($m.Name), $($m.OperatingSystem), $($m.OperatingSystemServicePack), $($m.OperatingSystemVersion), $($m.IPv4Address)" }
-        $rows | Set-Content -Path "$outputdir\machines_old.txt"
+        $rows | Set-Content -Path "$outputdir\machines_old.txt" -Encoding UTF8
     }
 }
 Function Get-DCsNotOwnedByDA {
@@ -1425,7 +1426,7 @@ Function Get-DCsNotOwnedByDA {
             $progresscount++
             Write-Progress -Activity "Searching for DCs not owned by Domain Admins group..." -Status "Currently identifed $count" -PercentComplete ($progresscount / $totalcount * 100)
             if ($machine.ntsecuritydescriptor.Owner -ne "$env:UserDomain\$DomainAdmins") {
-                Add-Content -Path "$outputdir\dcs_not_owned_by_da.txt" -Value "$($machine.Name), $($machine.OperatingSystem), $($machine.OperatingSystemServicePack), $($machine.OperatingSystemVersio), $($machine.IPv4Address), owned by $($machine.ntsecuritydescriptor.Owner)"
+                Add-Content -Path "$outputdir\dcs_not_owned_by_da.txt" -Value "$($machine.Name), $($machine.OperatingSystem), $($machine.OperatingSystemServicePack), $($machine.OperatingSystemVersio), $($machine.IPv4Address), owned by $($machine.ntsecuritydescriptor.Owner)" -Encoding UTF8
                 $count++
             }
         }
@@ -1572,7 +1573,7 @@ Function Get-GPOEnum {
             foreach ($member in (($xmlreport.GPO.Computer.ExtensionData.Extension.UserRightsAssignment | Where-Object { $_.Name -eq 'SeDenyInteractiveLogonRight' }).Member)) {
                 if ($member.Name.'#text' -match "$SchemaAdmins" -or $member.Name.'#text' -match "$DomainAdmins" -or $member.Name.'#text' -match "$EnterpriseAdmins") {
                     $AdminLocalLogonAllowed = $false
-                    Add-Content -Path "$outputdir\admin_logon_restrictions.txt" -Value "$($GPO.DisplayName) SeDenyInteractiveLogonRight $($member.Name.'#text')"
+                    Add-Content -Path "$outputdir\admin_logon_restrictions.txt" -Value "$($GPO.DisplayName) SeDenyInteractiveLogonRight $($member.Name.'#text')" -Encoding UTF8
                 }
             }
         }
@@ -1583,7 +1584,7 @@ Function Get-GPOEnum {
             foreach ($member in (($xmlreport.GPO.Computer.ExtensionData.Extension.UserRightsAssignment | Where-Object { $_.Name -eq 'SeDenyRemoteInteractiveLogonRight' }).Member)) {
                 if ($member.Name.'#text' -match "$SchemaAdmins" -or $member.Name.'#text' -match "$DomainAdmins" -or $member.Name.'#text' -match "$EnterpriseAdmins") {
                     $AdminRPDLogonAllowed = $false
-                    Add-Content -Path "$outputdir\admin_logon_restrictions.txt" -Value "$($GPO.DisplayName) SeDenyRemoteInteractiveLogonRight $($member.Name.'#text')"
+                    Add-Content -Path "$outputdir\admin_logon_restrictions.txt" -Value "$($GPO.DisplayName) SeDenyRemoteInteractiveLogonRight $($member.Name.'#text')" -Encoding UTF8
                 }
             }
         }
@@ -1594,7 +1595,7 @@ Function Get-GPOEnum {
             foreach ($member in (($xmlreport.GPO.Computer.ExtensionData.Extension.UserRightsAssignment | Where-Object { $_.Name -eq 'SeDenyNetworkLogonRight' }).Member)) {
                 if ($member.Name.'#text' -match "$SchemaAdmins" -or $member.Name.'#text' -match "$DomainAdmins" -or $member.Name.'#text' -match "$EnterpriseAdmins") {
                     $AdminNetworkLogonAllowed = $false
-                    Add-Content -Path "$outputdir\admin_logon_restrictions.txt" -Value "$($GPO.DisplayName) SeDenyNetworkLogonRight $($member.Name.'#text')"
+                    Add-Content -Path "$outputdir\admin_logon_restrictions.txt" -Value "$($GPO.DisplayName) SeDenyNetworkLogonRight $($member.Name.'#text')" -Encoding UTF8
                 }
             }
         }
@@ -1632,19 +1633,19 @@ Function Get-GPOEnum {
             Write-Both "    [+] NTLM authentication hardening implemented, but NTLM not denied"
             foreach ($record in $HardenNTLM) {
                 Write-Both "        [-] $($record.value)"
-                Add-Content -Path "$outputdir\ntlm_restrictions.txt" -Value "NTLM restricted by GPO [$($record.gpo)] with value [$($record.value)]"
+                Add-Content -Path "$outputdir\ntlm_restrictions.txt" -Value "NTLM restricted by GPO [$($record.gpo)] with value [$($record.value)]" -Encoding UTF8
             }
         }
     }
     else {
         foreach ($record in $DenyNTLM) {
-            Add-Content -Path "$outputdir\ntlm_restrictions.txt" -Value "NTLM restricted by GPO [$($record.gpo)] with value [$($record.value)]"
+            Add-Content -Path "$outputdir\ntlm_restrictions.txt" -Value "NTLM restricted by GPO [$($record.gpo)] with value [$($record.value)]" -Encoding UTF8
         }
     }
     #Output for NTLM exceptions
     if ($NTLMAuthExceptions.count -ne 0) {
         foreach ($record in $NTLMAuthExceptions) {
-            Add-Content -Path "$outputdir\ntlm_restrictions.txt" -Value "NTLM auth exceptions $($record)"
+            Add-Content -Path "$outputdir\ntlm_restrictions.txt" -Value "NTLM auth exceptions $($record)" -Encoding UTF8
         }
     }
     #Output for NTLM audit
@@ -1653,7 +1654,7 @@ Function Get-GPOEnum {
     }
     else {
         foreach ($record in $DenyNTLM) {
-            Add-Content -Path "$outputdir\ntlm_restrictions.txt" -Value "NTLM audit GPO [$($record.gpo)] with value [$($record.value)]"
+            Add-Content -Path "$outputdir\ntlm_restrictions.txt" -Value "NTLM audit GPO [$($record.gpo)] with value [$($record.value)]" -Encoding UTF8
         }
     }
 }
@@ -1666,7 +1667,7 @@ Function Get-PrivilegedGroupMembership {
             if (($SchemaMembers | measure).count -ne 0) {
                 Write-Both "    [!] Schema Admins not empty!!!"
                 foreach ($member in $SchemaMembers) {
-                    Add-Content -Path "$outputdir\schema_admins.txt" -Value "$($member.objectClass) $($member.SamAccountName) $($member.Name)"
+                    Add-Content -Path "$outputdir\schema_admins.txt" -Value "$($member.objectClass) $($member.SamAccountName) $($member.Name)" -Encoding UTF8
                 }
             }
         } catch {
@@ -1682,7 +1683,7 @@ Function Get-PrivilegedGroupMembership {
             if (($EnterpriseMembers | measure).count -ne 0) {
                 Write-Both "    [!] Enterprise Admins not empty!!!"
                 foreach ($member in $EnterpriseMembers) {
-                    Add-Content -Path "$outputdir\enterprise_admins.txt" -Value "$($member.objectClass) $($member.SamAccountName) $($member.Name)"
+                    Add-Content -Path "$outputdir\enterprise_admins.txt" -Value "$($member.objectClass) $($member.SamAccountName) $($member.Name)" -Encoding UTF8
                 }
             }
         } catch {
@@ -1695,7 +1696,7 @@ Function Get-PrivilegedGroupMembership {
     try {
         $DomainAdminsMembers = Get-ADGroup $DomainAdmins -ErrorAction Stop | Get-ADGroupMember -ErrorAction Stop
         foreach ($member in $DomainAdminsMembers) {
-            Add-Content -Path "$outputdir\domain_admins.txt" -Value "$($member.objectClass) $($member.SamAccountName) $($member.Name)"
+            Add-Content -Path "$outputdir\domain_admins.txt" -Value "$($member.objectClass) $($member.SamAccountName) $($member.Name)" -Encoding UTF8
         }
     } catch {
         Write-Both "    [!] Error retrieving Domain Admins members: $($_.Exception.Message)"
@@ -1758,7 +1759,7 @@ Function Get-DCEval {
     foreach ($Site in $Forest.Sites) {
         if (($ADs | Where-Object { $_.Site -eq $Site.Name } | Where-Object { $_.IsGlobalCatalog -eq $true }) -eq $null) {
             $SitesWithNoGC = $true
-            Add-Content -Path "$outputdir\sites_no_gc.txt" -Value "$($Site.Name)"
+            Add-Content -Path "$outputdir\sites_no_gc.txt" -Value "$($Site.Name)" -Encoding UTF8
         }
     }
     if ($SitesWithNoGC -eq $true) {
@@ -1777,7 +1778,7 @@ Function Get-DCEval {
         #See https://techcommunity.microsoft.com/t5/core-infrastructure-and-security/decrypting-the-selection-of-supported-kerberos-encryption-types/ba-p/1628797
         if ($DC."msDS-SupportedEncryptionTypes" -ne 8 -and $DC."msDS-SupportedEncryptionTypes" -ne 16 -and $DC."msDS-SupportedEncryptionTypes" -ne 24) {
             $WeakKerberos = $true
-            Add-Content -Path "$outputdir\dcs_weak_kerberos_ciphersuite.txt" -Value "$($DC.DNSHostName) $($dc."msDS-SupportedEncryptionTypes")"
+            Add-Content -Path "$outputdir\dcs_weak_kerberos_ciphersuite.txt" -Value "$($DC.DNSHostName) $($dc."msDS-SupportedEncryptionTypes")" -Encoding UTF8
         }
     }
     if ($WeakKerberos) {
@@ -1820,7 +1821,7 @@ Function Get-DefaultDomainControllersPolicy {
         foreach ($member in (($xmlreport.GPO.Computer.ExtensionData.Extension.UserRightsAssignment | Where-Object { $_.Name -eq 'SeInteractiveLogonRight' }).Member)) {
             if ($member.Name.'#text' -ne "BUILTIN\$Administrators" -and $member.Name.'#text' -ne "$EntrepriseDomainControllers") {
                 $ExcessiveDCInteractiveLogon = $true
-                Add-Content -Path "$outputdir\default_domain_controller_policy_audit.txt" -Value "SeInteractiveLogonRight $($member.Name.'#text')"
+                Add-Content -Path "$outputdir\default_domain_controller_policy_audit.txt" -Value "SeInteractiveLogonRight $($member.Name.'#text')" -Encoding UTF8
             }
         }
     }
@@ -1831,7 +1832,7 @@ Function Get-DefaultDomainControllersPolicy {
         foreach ($member in (($xmlreport.GPO.Computer.ExtensionData.Extension.UserRightsAssignment | Where-Object { $_.Name -eq 'SeBatchLogonRight' }).Member)) {
             if ($member.Name.'#text' -ne "BUILTIN\$Administrators") {
                 $ExcessiveDCBatchLogonPermissions = $true
-                Add-Content -Path "$outputdir\default_domain_controller_policy_audit.txt" -Value "SeBatchLogonRight $($member.Name.'#text')"
+                Add-Content -Path "$outputdir\default_domain_controller_policy_audit.txt" -Value "SeBatchLogonRight $($member.Name.'#text')" -Encoding UTF8
             }
         }
     }
@@ -1842,7 +1843,7 @@ Function Get-DefaultDomainControllersPolicy {
         foreach ($member in (($xmlreport.GPO.Computer.ExtensionData.Extension.UserRightsAssignment | Where-Object { $_.Name -eq 'SeRemoteInteractiveLogonRight' }).Member)) {
             if ($member.Name.'#text' -ne "BUILTIN\$Administrators" -and $member.Name.'#text' -ne "$EntrepriseDomainControllers") {
                 $ExcessiveDCRDPLogonPermissions = $true
-                Add-Content -Path "$outputdir\default_domain_controller_policy_audit.txt" -Value "SeRemoteInteractiveLogonRight $($member.Name.'#text')"
+                Add-Content -Path "$outputdir\default_domain_controller_policy_audit.txt" -Value "SeRemoteInteractiveLogonRight $($member.Name.'#text')" -Encoding UTF8
             }
         }
     }
@@ -1853,7 +1854,7 @@ Function Get-DefaultDomainControllersPolicy {
         foreach ($member in (($xmlreport.GPO.Computer.ExtensionData.Extension.UserRightsAssignment | Where-Object { $_.Name -eq 'SeBackupPrivilege' }).Member)) {
             if ($member.Name.'#text' -ne "BUILTIN\$Administrators") {
                 $ExcessiveDCBackupPermissions = $true
-                Add-Content -Path "$outputdir\default_domain_controller_policy_audit.txt" -Value "SeBackupPrivilege $($member.Name.'#text')"
+                Add-Content -Path "$outputdir\default_domain_controller_policy_audit.txt" -Value "SeBackupPrivilege $($member.Name.'#text')" -Encoding UTF8
             }
         }
     }
@@ -1864,7 +1865,7 @@ Function Get-DefaultDomainControllersPolicy {
         foreach ($member in (($xmlreport.GPO.Computer.ExtensionData.Extension.UserRightsAssignment | Where-Object { $_.Name -eq 'SeRestorePrivilege' }).Member)) {
             if ($member.Name.'#text' -ne "BUILTIN\$Administrators") {
                 $ExcessiveDCRestorePermissions = $true
-                Add-Content -Path "$outputdir\default_domain_controller_policy_audit.txt" -Value "SeRestorePrivilege $($member.Name.'#text')"
+                Add-Content -Path "$outputdir\default_domain_controller_policy_audit.txt" -Value "SeRestorePrivilege $($member.Name.'#text')" -Encoding UTF8
             }
         }
     }
@@ -1875,7 +1876,7 @@ Function Get-DefaultDomainControllersPolicy {
         foreach ($member in (($xmlreport.GPO.Computer.ExtensionData.Extension.UserRightsAssignment | Where-Object { $_.Name -eq 'SeLoadDriverPrivilege' }).Member)) {
             if ($member.Name.'#text' -ne "BUILTIN\$Administrators") {
                 $ExcessiveDCDriverPermissions = $true
-                Add-Content -Path "$outputdir\default_domain_controller_policy_audit.txt" -Value "SeLoadDriverPrivilege $($member.Name.'#text')"
+                Add-Content -Path "$outputdir\default_domain_controller_policy_audit.txt" -Value "SeLoadDriverPrivilege $($member.Name.'#text')" -Encoding UTF8
             }
         }
     }
@@ -1886,7 +1887,7 @@ Function Get-DefaultDomainControllersPolicy {
         foreach ($member in (($xmlreport.GPO.Computer.ExtensionData.Extension.UserRightsAssignment | Where-Object { $_.Name -eq 'SeShutdownPrivilege' }).Member)) {
             if ($member.Name.'#text' -ne "BUILTIN\$Administrators") {
                 $ExcessiveDCLocalShutdownPermissions = $true
-                Add-Content -Path "$outputdir\default_domain_controller_policy_audit.txt" -Value "SeShutdownPrivilege $($member.Name.'#text')"
+                Add-Content -Path "$outputdir\default_domain_controller_policy_audit.txt" -Value "SeShutdownPrivilege $($member.Name.'#text')" -Encoding UTF8
             }
         }
     }
@@ -1897,7 +1898,7 @@ Function Get-DefaultDomainControllersPolicy {
         foreach ($member in (($xmlreport.GPO.Computer.ExtensionData.Extension.UserRightsAssignment | Where-Object { $_.Name -eq 'SeRemoteShutdownPrivilege' }).Member)) {
             if ($member.Name.'#text' -ne "BUILTIN\$Administrators") {
                 $ExcessiveDCRemoteShutdownPermissions = $true
-                Add-Content -Path "$outputdir\default_domain_controller_policy_audit.txt" -Value "SeRemoteShutdownPrivilege $($member.Name.'#text')"
+                Add-Content -Path "$outputdir\default_domain_controller_policy_audit.txt" -Value "SeRemoteShutdownPrivilege $($member.Name.'#text')" -Encoding UTF8
             }
         }
     }
@@ -1908,7 +1909,7 @@ Function Get-DefaultDomainControllersPolicy {
         foreach ($member in (($xmlreport.GPO.Computer.ExtensionData.Extension.UserRightsAssignment | Where-Object { $_.Name -eq 'SeSystemTimePrivilege' }).Member)) {
             if ($member.Name.'#text' -ne "BUILTIN\$Administrators" -and $member.Name.'#text' -ne "$LocalService") {
                 $ExcessiveDCTimePermissions = $true
-                Add-Content -Path "$outputdir\default_domain_controller_policy_audit.txt" -Value "SeSystemTimePrivilege $($member.Name.'#text')"
+                Add-Content -Path "$outputdir\default_domain_controller_policy_audit.txt" -Value "SeSystemTimePrivilege $($member.Name.'#text')" -Encoding UTF8
             }
         }
     }
@@ -1929,11 +1930,11 @@ Function Get-RecentChanges() {
     $totalcountUsers = ($newUsers  | Measure-Object | Select-Object Count).count
     $totalcountGroups = ($newGroups | Measure-Object | Select-Object Count).count
     if ($totalcountUsers -gt 0) {
-        foreach ($newUser in $newUsers ) { Add-Content -Path "$outputdir\new_users.txt" -Value "Account $($newUser.SamAccountName) was created $($newUser.whenCreated)" }
+        foreach ($newUser in $newUsers ) { Add-Content -Path "$outputdir\new_users.txt" -Value "Account $($newUser.SamAccountName) was created $($newUser.whenCreated)" } -Encoding UTF8
         Write-Both "    [!] $totalcountUsers new users were created last 30 days, see $outputdir\new_users.txt"
     }
     if ($totalcountGroups -gt 0) {
-        foreach ($newGroup in $newGroups ) { Add-Content -Path "$outputdir\new_groups.txt" -Value "Group $($newGroup.SamAccountName) was created $($newGroup.whenCreated)" }
+        foreach ($newGroup in $newGroups ) { Add-Content -Path "$outputdir\new_groups.txt" -Value "Group $($newGroup.SamAccountName) was created $($newGroup.whenCreated)" } -Encoding UTF8
         Write-Both "    [!] $totalcountGroups new groups were created last 30 days, see $outputdir\new_groups.txt"
     }
 }
@@ -2559,7 +2560,7 @@ Function Get-ADCSVulns {
         if ($tags.Count -gt 0) {
             $line = "{0} Vulnerable Template: {1}  (schemaVer={2}, EKUs={3}, NameFlags=0x{4:X}, EnrollFlags=0x{5:X})" -f `
                     ($tags -join ','), $name, $schemaVer, ($ekus -join ';'), $nameFlags, $enrollFlag
-            Add-Content -Path $template_path -Value $line
+            Add-Content -Path $template_path -Value $line -Encoding UTF8
             Write-Both "    [!] $line"
         }
       } catch {
@@ -2576,12 +2577,12 @@ Function Get-ADCSVulns {
         $sbe = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Kdc' -Name 'StrongCertificateBindingEnforcement' -ErrorAction Stop).StrongCertificateBindingEnforcement
         if ($sbe -lt 2) {
             $msg = "ESC10: StrongCertificateBindingEnforcement = $sbe (must be 2 since Feb 2025 enforcement). Weak PKINIT cert→user mapping (CVE-2022-34691) on $env:COMPUTERNAME."
-            Add-Content -Path $template_path -Value $msg
+            Add-Content -Path $template_path -Value $msg -Encoding UTF8
             Write-Both "    [!] $msg"
         }
     } catch {
         $msg = "ESC10: StrongCertificateBindingEnforcement registry value MISSING on $env:COMPUTERNAME — defaults to compatibility mode (weak)."
-        Add-Content -Path $template_path -Value $msg
+        Add-Content -Path $template_path -Value $msg -Encoding UTF8
         Write-Both "    [!] $msg"
     }
     # ESC14 — altSecurityIdentities mapping enforcement (CertificateMappingMethods)
@@ -2590,7 +2591,7 @@ Function Get-ADCSVulns {
         if ($cmm -ne $null -and ($cmm -band 0x04) -ne 0) {
             # 0x04 = UPN mapping, allows weak implicit mapping
             $msg = "ESC14: CertificateMappingMethods includes UPN-implicit mapping (value $cmm). Restrict to issuer/subject explicit mapping only."
-            Add-Content -Path $template_path -Value $msg
+            Add-Content -Path $template_path -Value $msg -Encoding UTF8
             Write-Both "    [!] $msg"
         }
     } catch {}
@@ -2604,11 +2605,11 @@ Function Get-ADCSVulns {
             try {
                 $response = Invoke-WebRequest -Uri ("http://$serverName/certsrv/") -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
                 # Reachable over HTTP without auth — vulnerable
-                Add-Content -Path $web_enrollmeent_path -Value "ESC8 Vulnerable: HTTP web enrollment reachable at http://$serverName/certsrv/ (status $($response.StatusCode))"
+                Add-Content -Path $web_enrollmeent_path -Value "ESC8 Vulnerable: HTTP web enrollment reachable at http://$serverName/certsrv/ (status $($response.StatusCode))" -Encoding UTF8
                 Write-Both "    [!] ESC8: HTTP web enrollment reachable at http://$serverName/certsrv/"
             } catch {
                 if ($_.Exception.Response.StatusCode -eq 401) {
-                    Add-Content -Path $web_enrollmeent_path -Value "ESC8 Vulnerable: HTTP web enrollment endpoint at http://$serverName/certsrv/ (NTLM relay possible)"
+                    Add-Content -Path $web_enrollmeent_path -Value "ESC8 Vulnerable: HTTP web enrollment endpoint at http://$serverName/certsrv/ (NTLM relay possible)" -Encoding UTF8
                     Write-Both "    [!] ESC8: HTTP web enrollment endpoint exposed at http://$serverName/certsrv/"
                 } else {
                     Write-Both "    [+] ESC8: HTTP web enrollment not reachable on $serverName"
@@ -2704,9 +2705,13 @@ Function Get-SPNs {
 }
 
 function Get-ADUsersWithoutPreAuth {
-    # Use boolean comparisons (not strings) — DoesNotRequirePreAuth and Enabled are System.Boolean,
-    # the historical "True" string compare relied on coercion and is fragile across module versions.
-    $ASREP = Get-ADUser -Filter * -Properties DoesNotRequirePreAuth, Enabled | Where-Object { $_.DoesNotRequirePreAuth -eq $true -and $_.Enabled -eq $true } | Select-Object Name
+    # Server-side filter: UAC bit 4194304 = DONT_REQ_PREAUTH; combine with !disabled (UAC bit 2).
+    # LDAP bitwise filter (1.2.840.113556.1.4.803) avoids pulling every user object.
+    $ldapFilter = '(&(objectCategory=person)(objectClass=user)' +
+                  '(userAccountControl:1.2.840.113556.1.4.803:=4194304)' +
+                  '(!(userAccountControl:1.2.840.113556.1.4.803:=2)))'
+    $ASREP = Get-ADUser -LDAPFilter $ldapFilter -Properties DoesNotRequirePreAuth, Enabled |
+             Select-Object Name
     foreach ($user in $ASREP) {
         $asrepuser = '    [!] AS-REP Roastable user: ' + $user.Name
         Write-both $asrepuser
@@ -2849,21 +2854,21 @@ function Get-UnconstrainedDelegation {
 
     if ($allRows.Count -gt 0) {
         $evidencePath = "$outputdir\UnconstrainedDelegation.txt"
-        $allRows | Set-Content -Path $evidencePath
+        $allRows | Set-Content -Path $evidencePath -Encoding UTF8
         Write-Nessus-Finding "Unconstrained Kerberos Delegation" "KB730" ([System.IO.File]::ReadAllText($evidencePath))
         if ($constrainedPTFindings.Count -gt 0) {
-            $cptPath = "$outputdir\ConstrainedDelegationPT.txt"
-            $constrainedPTFindings | Set-Content -Path $cptPath
+            $cptPath = "$outputdir\ConstrainedDelegation.txt"
+            $constrainedPTFindings | Set-Content -Path $cptPath -Encoding UTF8
             Write-Nessus-Finding "Constrained Delegation with Protocol Transition" "KB733" ([System.IO.File]::ReadAllText($cptPath))
         }
         if ($rbcdFindings.Count -gt 0) {
             $rbcdPath = "$outputdir\RBCD.txt"
-            $rbcdFindings | Set-Content -Path $rbcdPath
+            $rbcdFindings | Set-Content -Path $rbcdPath -Encoding UTF8
             Write-Nessus-Finding "Resource-Based Constrained Delegation Configured" "KB734" ([System.IO.File]::ReadAllText($rbcdPath))
         }
         if ($shadowCredFindings.Count -gt 0) {
             $scPath = "$outputdir\ShadowCredentials.txt"
-            $shadowCredFindings | Set-Content -Path $scPath
+            $shadowCredFindings | Set-Content -Path $scPath -Encoding UTF8
             Write-Nessus-Finding "Shadow Credentials (msDS-KeyCredentialLink)" "KB735" ([System.IO.File]::ReadAllText($scPath))
         }
     } else {
@@ -2947,7 +2952,7 @@ function Get-DCSyncRights {
 
     if ($findings.Count -gt 0) {
         $evidencePath = "$outputdir\DCSyncRights.txt"
-        $findings | Set-Content -Path $evidencePath
+        $findings | Set-Content -Path $evidencePath -Encoding UTF8
         Write-Nessus-Finding "DCSync Rights Detected" "KB731" ([System.IO.File]::ReadAllText($evidencePath))
     } else {
         Write-Both "    [+] No non-standard accounts with DCSync rights found (DomainRoot + AdminSDHolder + Configuration + Schema)"
@@ -3004,7 +3009,6 @@ function Get-HostHardeningChecks {
     try {
         $cgPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard'
         $enableVBS = (Get-ItemProperty -Path $cgPath -Name 'EnableVirtualizationBasedSecurity' -ErrorAction Stop).EnableVirtualizationBasedSecurity
-        $cgFlags  = (Get-ItemProperty -Path $cgPath -Name 'RequirePlatformSecurityFeatures' -ErrorAction Stop).RequirePlatformSecurityFeatures
         if ($enableVBS -eq 1) {
             Write-Both "    [+] Virtualization Based Security (Credential Guard) is enabled"
         } else {
@@ -3076,7 +3080,7 @@ function Get-HostHardeningChecks {
 
     if ($findings.Count -gt 0) {
         $evidencePath = "$outputdir\HostHardening.txt"
-        $findings | Set-Content -Path $evidencePath
+        $findings | Set-Content -Path $evidencePath -Encoding UTF8
         Write-Nessus-Finding "Host Hardening Deficiencies" "KB732" ([System.IO.File]::ReadAllText($evidencePath))
     } else {
         Write-Both "    [+] No host hardening deficiencies found on $env:COMPUTERNAME"
@@ -3097,13 +3101,13 @@ function Get-LDAPSecurity {
         }
         else {
             Write-Both "    [!] Issue identified LDAP signing is not enabled on $computerName, the registry value is currently set to $ldapSigning."
-            Add-Content -Path $outputdir\LDAPSecurity.txt -Value "LDAP signing is not enabled on $computerName, the registry key does not exist"
+            Add-Content -Path $outputdir\LDAPSecurity.txt -Value "LDAP signing is not enabled on $computerName, the registry key does not exist" -Encoding UTF8
             Write-Nessus-Finding "Weak LDAP Settings" "KB1101" "LDAP signing is not enabled on $computerName, the registry key does not exist"
         }
     }
     catch {
         Write-both "    [!] Issue identified LDAP signing is not enabled on $computerName, the registry key does not exist."
-        Add-Content -Path $outputdir\LDAPSecurity.txt -Value "LDAP signing is not enabled on $computerName, the registry key does not exist"
+        Add-Content -Path $outputdir\LDAPSecurity.txt -Value "LDAP signing is not enabled on $computerName, the registry key does not exist" -Encoding UTF8
         Write-Nessus-Finding "Weak LDAP Settings" "KB1101" "LDAP signing is not enabled on $computerName, the registry key does not exist"
     }
 
@@ -3125,7 +3129,7 @@ function Get-LDAPSecurity {
         Write-Both "    [+] LDAPS is configured on $computerName"
     } else {
         Write-Both "    [!] Issue identified LDAPS is not configured on $computerName, LDAPs certificates are not configured"
-        Add-Content -Path $outputdir\LDAPSecurity.txt -Value "LDAPS is not configured on $computerName, LDAPs certificates are not configured"
+        Add-Content -Path $outputdir\LDAPSecurity.txt -Value "LDAPS is not configured on $computerName, LDAPs certificates are not configured" -Encoding UTF8
         Write-Nessus-Finding "Weak LDAP Settings" "KB1101" "LDAPS is not configured on $computerName, LDAPs certificates are not configured"
     }
 
@@ -3139,13 +3143,13 @@ function Get-LDAPSecurity {
         }
         else {
             Write-both "    [!] Issue identified LDAPS channel binding is not enabled on $computerName, currently set to $ldapsBinding"
-            Add-Content -Path $outputdir\LDAPSecurity.txt -Value "LDAPS channel binding is not enabled on $computerName, currently set to $ldapsBinding"
+            Add-Content -Path $outputdir\LDAPSecurity.txt -Value "LDAPS channel binding is not enabled on $computerName, currently set to $ldapsBinding" -Encoding UTF8
             Write-Nessus-Finding "Weak LDAP Settings" "KB1101" "LDAPS channel binding is not enabled on $computerName, currently set to $ldapsBinding"
         }
     }
     catch {
         Write-both "    [!] Issue identified LDAPS channel binding is not enabled on $computerName, the registry key does not exist"
-        Add-Content -Path $outputdir\LDAPSecurity.txt -Value "LDAPS channel binding is not enabled on $computerName, the registry key does not exist"
+        Add-Content -Path $outputdir\LDAPSecurity.txt -Value "LDAPS channel binding is not enabled on $computerName, the registry key does not exist" -Encoding UTF8
         Write-Nessus-Finding "Weak LDAP Settings" "KB1101" "LDAPS channel binding is not enabled on $computerName, the registry key does not exist"
     }
 
@@ -3190,7 +3194,7 @@ function Get-LDAPSecurity {
 
         if (-not $defaultNC) {
          Write-Both "    [+] LDAP null session not useful on $Server`:$Port (no naming context visible)"
-         Add-Content -Path (Join-Path $outputdir 'LDAPSecurity.txt') -Value "Anonymous bind present but NC not visible on $Server`:$Port"
+         Add-Content -Path (Join-Path $outputdir 'LDAPSecurity.txt') -Value "Anonymous bind present but NC not visible on $Server`:$Port" -Encoding UTF8
          return
         }
 
@@ -3210,7 +3214,7 @@ function Get-LDAPSecurity {
             $res.Entries.Count -gt 0) {
 
             Write-Both "    [!] LDAP anonymous (null) bind allows directory READ on $Server`:$Port"
-            Add-Content -Path (Join-Path $outputdir 'LDAPSecurity.txt') -Value "Anonymous bind allows directory read on $Server`:$Port"
+            Add-Content -Path (Join-Path $outputdir 'LDAPSecurity.txt') -Value "Anonymous bind allows directory read on $Server`:$Port" -Encoding UTF8
             Write-Nessus-Finding "Weak LDAP Settings" "KB1101" "Anonymous LDAP bind allows directory read on $Server`:$Port"
 
         } else {
@@ -3224,7 +3228,7 @@ function Get-LDAPSecurity {
         if ($resp) {
          Write-Both ("    [+] LDAP null session not allowed/useful on {0}:{1} - Result: {2} ({3}) Msg: {4}" -f `
                 $Server, $Port, [int]$resp.ResultCode, $resp.ResultCode, $resp.ErrorMessage)
-            Add-Content -Path (Join-Path $outputdir 'LDAPSecurity.txt') -Value "Anonymous bind present but read blocked on $Server`:$Port"
+            Add-Content -Path (Join-Path $outputdir 'LDAPSecurity.txt') -Value "Anonymous bind present but read blocked on $Server`:$Port" -Encoding UTF8
         } else {
             Write-Both "    [+] LDAP null session not allowed/useful on $Server`:$Port (directory operation blocked)"
         }
@@ -3871,8 +3875,12 @@ function Invoke-AuditModule {
             $script:moduleResults[$Name].errors_captured  = [math]::Max(0, ($Error.Count - $errorsBefore))
             if ($script:moduleResults[$Name].errors_captured -gt 0) {
                 Write-Both "    [!] Module '$Name' completed with $($script:moduleResults[$Name].errors_captured) non-terminating error(s) — see logs/errors.log"
-                # Drain captured errors to errors.log without failing the module
-                for ($i = 0; $i -lt $script:moduleResults[$Name].errors_captured; $i++) {
+                # Drain captured errors to errors.log without failing the module.
+                # $Error is LIFO ($Error[0] = newest); we want the new errors that
+                # occurred during this module, oldest-first. Iterate from the
+                # boundary back toward index 0.
+                $newCount = $script:moduleResults[$Name].errors_captured
+                for ($i = $newCount - 1; $i -ge 0; $i--) {
                     try { Write-ErrorLog -Context "module:$Name" -ErrorRecord $Error[$i] } catch {}
                 }
             }

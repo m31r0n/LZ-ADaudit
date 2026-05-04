@@ -1,4 +1,4 @@
-"""Command-line entry point for the report generator (v1.5.0)."""
+"""Command-line entry point for the report generator."""
 from __future__ import annotations
 
 import argparse
@@ -7,6 +7,7 @@ import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import __version__
 from .data import auto_detect_folder, load_audit_data, IncidentConfig
 
 try:

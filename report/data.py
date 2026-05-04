@@ -140,7 +140,11 @@ class AuditData:
 
 def read_text(path: Path) -> str:
     raw = path.read_bytes()
-    for bom, enc in ((b"\xef\xbb\xbf", "utf-8-sig"), (b"\xff\xfe", "utf-16")):
+    for bom, enc in (
+        (b"\xef\xbb\xbf", "utf-8-sig"),
+        (b"\xff\xfe", "utf-16"),       # UTF-16-LE
+        (b"\xfe\xff", "utf-16"),       # UTF-16-BE (PS Core -Encoding bigendianunicode)
+    ):
         if raw.startswith(bom):
             return raw.decode(enc)
     return raw.decode("utf-8", errors="replace")

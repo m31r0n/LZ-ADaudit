@@ -1,6 +1,9 @@
-"""XLSX workbook builder. Same as the v1.4.x report.xlsx layout, plus a
-new "IR" sheet that surfaces correlations + post-ransomware checklist when
-incident mode is active."""
+"""XLSX workbook builder.
+
+Produces the multi-sheet workbook shipped alongside the HTML report
+(Summary, Findings, inventories, evidence, remediation plan, modules,
+preflight). IR-specific sheets are not yet emitted — IR data appears
+only in the HTML report."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -464,5 +467,3 @@ def build_xlsx(data: AuditData, path: Path) -> None:
                 ws.cell(ri, 1).fill = fill
                 ws.cell(ri, 1).font = WHITE_FONT
         _auto_width(ws)
-
-    # ---- v1.5.0:
