@@ -467,3 +467,5 @@ def build_xlsx(data: AuditData, path: Path) -> None:
                 ws.cell(ri, 1).fill = fill
                 ws.cell(ri, 1).font = WHITE_FONT
         _auto_width(ws)
+
+    wb.save(path)
